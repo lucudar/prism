@@ -49,7 +49,7 @@ impl Settings {
             let _ = fs::create_dir_all(dir);
         }
         if let Ok(t) = serde_json::to_string_pretty(self) {
-            let _ = fs::write(path, t);
+            let _ = crate::util::write_atomic(path, t);
         }
     }
 }

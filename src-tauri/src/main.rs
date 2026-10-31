@@ -135,7 +135,7 @@ fn write_user_sites(z: &ZapretPaths, sites: &[String]) -> R<()> {
         body.push_str(s);
         body.push_str("\r\n");
     }
-    std::fs::write(z.user_list(), body).map_err(|e| format!("Не удалось сохранить список: {e}"))
+    util::write_atomic(&z.user_list(), body).map_err(|e| format!("Не удалось сохранить список: {e}"))
 }
 
 /// Запустить движок и убедиться, что он не упал сразу.
