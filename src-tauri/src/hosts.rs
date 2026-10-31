@@ -2,7 +2,7 @@
 //! записываются в файл hosts Windows. Берём только разделы с нейросетями.
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use crate::util::run_quiet;
 
@@ -12,8 +12,7 @@ const END: &str = "# <<< Prism";
 const SECTIONS: &[&str] = &["OpenAI", "Microsoft", "GitHub Copilot", "ElevenLabs", "Grok", "DeepL", "Google", "Claude"];
 
 pub fn hosts_path() -> PathBuf {
-    let root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".into());
-    Path::new(&root).join("System32").join("drivers").join("etc").join("hosts")
+    crate::secure::system_dir().join("drivers").join("etc").join("hosts")
 }
 
 /// Оставить из списка только нужные разделы и строки «IP домен».

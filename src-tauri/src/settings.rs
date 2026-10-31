@@ -37,10 +37,11 @@ impl Default for Settings {
 
 impl Settings {
     pub fn load(path: &Path) -> Self {
-        fs::read_to_string(path)
-            .ok()
-            .and_then(|t| serde_json::from_str(&t).ok())
-            .unwrap_or_default()
+        Self::parse(&fs::read_to_string(path).unwrap_or_default())
+    }
+
+    pub fn parse(text: &str) -> Self {
+        serde_json::from_str(text).unwrap_or_default()
     }
 
     pub fn save(&self, path: &Path) {

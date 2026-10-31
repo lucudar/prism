@@ -263,6 +263,11 @@ impl Engine {
         if games {
             ensure_game_lists(paths, log);
         }
+        // Имя стратегии приходит из настроек и окна, поэтому берём только файл из списка:
+        // путь вида ..\другой.bat подсунул бы winws.exe чужие аргументы.
+        if !list_strategies(paths).iter().any(|s| s.id == strategy) {
+            return Err("Такой стратегии нет. Выберите другую.".into());
+        }
         let bat = paths.strategies().join(strategy);
         let text = fs::read_to_string(&bat).map_err(|e| format!("Не удалось прочитать стратегию: {e}"))?;
         let args = parse_bat(&text, paths, games)?;

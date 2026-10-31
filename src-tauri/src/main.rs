@@ -3,12 +3,13 @@
 mod engine;
 mod hosts;
 mod probe;
+mod secure;
 mod settings;
 mod tgproxy;
 mod updates;
 mod util;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -36,6 +37,8 @@ struct Inner {
 struct Prism {
     inner: Mutex<Inner>,
     log: Log,
+    /// Защищённая папка в %ProgramData% (см. secure.rs).
+    data: PathBuf,
     zapret: ZapretPaths,
     tg_exe: PathBuf,
     settings_file: PathBuf,
@@ -272,7 +275,12 @@ async fn update_app(app: AppHandle, p: State<'_, Prism>) -> R<()> {
     let asset = updates::app_asset(&rel).ok_or("В релизе нет установщика")?.clone();
     p.log.push(format!("[prism] скачиваю Prism {}", rel.tag_name));
     let bytes = updates::download_verified(&asset).await?;
-    let path = std::env::temp_dir().join(&asset.name);
+    // Не в %TEMP%: оттуда установщик, который запускается с правами администратора,
+    // успела бы подменить любая программа пользователя.
+    let dir = p.data.join("updates");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("Не удалось сохранить установщик: {e}"))?;
+    let path = dir.join("Prism-setup.exe");
     std::fs::write(&path, bytes).map_err(|e| format!("Не удалось сохранить установщик: {e}"))?;
     std::process::Command::new(&path).spawn().map_err(|e| format!("Не удалось запустить установщик: {e}"))?;
     shutdown(&app);
@@ -314,6 +322,9 @@ async fn set_engine(p: State<'_, Prism>, on: bool) -> R<AppState> {
 
 #[tauri::command]
 async fn set_strategy(p: State<'_, Prism>, id: String) -> R<AppState> {
+    if !engine::list_strategies(&p.zapret).iter().any(|s| s.id == id) {
+        return Err("Такой стратегии нет".into());
+    }
     let running = {
         let mut i = p.inner.lock().unwrap();
         i.settings.strategy = id;
@@ -368,7 +379,7 @@ async fn set_tg(p: State<'_, Prism>, on: bool) -> R<AppState> {
     {
         let mut i = p.inner.lock().unwrap();
         if on {
-            if i.settings.tg_secret.len() != 32 {
+            if !tgproxy::valid_secret(&i.settings.tg_secret) {
                 i.settings.tg_secret = tgproxy::new_secret();
             }
             let (port, secret) = (i.settings.tg_port, i.settings.tg_secret.clone());
@@ -595,19 +606,24 @@ fn task_xml(exe: &std::path::Path) -> String {
     )
 }
 
-fn set_autostart_task(on: bool, log: &Log) -> R<()> {
+const AUTOSTART_PORTABLE: &str = "Автозапуск работает только у установленной версии Prism. Портативную копию может подменить любая программа, а задание запускало бы её с правами администратора без вопроса.";
+
+fn set_autostart_task(on: bool, dir: &std::path::Path, log: &Log) -> R<()> {
     if !on {
         run_quiet("schtasks", &["/Delete", "/F", "/TN", TASK_NAME]);
         log.push("[prism] автозапуск выключен");
         return Ok(());
     }
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    if !secure::in_program_files(&exe) {
+        return Err(AUTOSTART_PORTABLE.into());
+    }
     // schtasks читает XML в UTF-16 с меткой порядка байтов, как его сохраняет сам планировщик.
     let mut bytes = vec![0xFF, 0xFE];
     for unit in task_xml(&exe).encode_utf16() {
         bytes.extend_from_slice(&unit.to_le_bytes());
     }
-    let file = std::env::temp_dir().join("prism-autostart.xml");
+    let file = dir.join("prism-autostart.xml");
     let file_s = file.display().to_string();
     let ok = std::fs::write(&file, &bytes).is_ok()
         && run_quiet("schtasks", &["/Create", "/F", "/TN", TASK_NAME, "/XML", &file_s]);
@@ -627,7 +643,7 @@ fn set_autostart_task(on: bool, log: &Log) -> R<()> {
 
 #[tauri::command]
 async fn set_autostart(p: State<'_, Prism>, on: bool) -> R<AppState> {
-    set_autostart_task(on, &p.log)?;
+    set_autostart_task(on, &p.data, &p.log)?;
     {
         let mut i = p.inner.lock().unwrap();
         i.settings.autostart = on;
@@ -683,19 +699,62 @@ fn shutdown(app: &AppHandle) {
     engine::unload_driver();
 }
 
+/// Свои списки сайтов и подсетей, которые переносятся из прошлых версий.
+const USER_LISTS: [&str; 3] = ["list-general-user.txt", "list-exclude-user.txt", "ipset-exclude-user.txt"];
+
+/// Строка списка zapret: домен, IP или подсеть. Остальное при переносе отбрасывается.
+fn list_line(l: &str) -> bool {
+    !l.is_empty() && l.chars().all(|c| c.is_ascii_alphanumeric() || ".-:/_".contains(c))
+}
+
+/// Прошлые версии хранили настройки и списки в %LOCALAPPDATA%, куда может писать
+/// любая программа пользователя. Переносим их один раз: файлы читаются без перехода
+/// по ссылкам, из списков берутся только адреса, а настройки проверяются при запуске.
+fn migrate_old(old: &Path, zapret: &ZapretPaths, log: &Log) -> Settings {
+    let Some(text) = secure::read_user_file(&old.join("settings.json"), 64 * 1024) else {
+        return Settings::default();
+    };
+    let settings = Settings::parse(&text);
+    let _ = std::fs::create_dir_all(zapret.lists());
+    for name in USER_LISTS {
+        let Some(body) = secure::read_user_file(&old.join("zapret").join("lists").join(name), 1 << 20) else { continue };
+        let lines: Vec<&str> = body.lines().map(str::trim).filter(|l| list_line(l)).collect();
+        if !lines.is_empty() {
+            let _ = std::fs::write(zapret.lists().join(name), lines.join("\r\n") + "\r\n");
+        }
+    }
+    log.push("[prism] настройки и списки перенесены из папки прошлой версии");
+    settings
+}
+
 fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     let log = Log::default();
     let res = app.path().resource_dir()?.join("resources");
-    let data = app.path().app_local_data_dir()?;
+    let installed = secure::in_program_files(&std::env::current_exe()?);
+    let root = secure::data_dir(&log)?;
+    // Файлы портативной копии может подменить пользователь, поэтому она хранит
+    // всё отдельно и не подсовывает свои файлы установленной версии.
+    let data = if installed { root } else { root.join("portable") };
     std::fs::create_dir_all(&data)?;
+
+    let cfg = app.config().app.windows.iter().find(|w| w.label == "main").cloned().ok_or("нет окна main")?;
+    tauri::WebviewWindowBuilder::from_config(app.handle(), &cfg)?.data_directory(data.join("webview")).build()?;
+
     let zapret = ZapretPaths { root: data.join("zapret") };
     if let Err(e) = engine::install(&res.join("zapret"), &zapret.root, &log) {
         log.push(format!("[prism] {e}"));
     }
     let settings_file = data.join("settings.json");
-    let mut settings = Settings::load(&settings_file);
-    if settings.tg_secret.len() != 32 {
+    let mut settings = if settings_file.exists() {
+        Settings::load(&settings_file)
+    } else {
+        migrate_old(&app.path().app_local_data_dir()?, &zapret, &log)
+    };
+    if !tgproxy::valid_secret(&settings.tg_secret) {
         settings.tg_secret = tgproxy::new_secret();
+    }
+    if !engine::list_strategies(&zapret).iter().any(|s| s.id == settings.strategy) {
+        settings.strategy = "general.bat".into();
     }
     // Запуск при входе в Windows: всё должно заработать сразу, поэтому обход включается,
     // даже если в прошлый раз его выключили вручную.
@@ -715,6 +774,7 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         tg_exe: res.join("tgproxy").join("tg-ws-proxy.exe"),
         settings_file,
         hosts_cache: data.join("ai-hosts.txt"),
+        data,
     });
 
     // Трей
@@ -783,9 +843,18 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
 
         // Обновить задание автозапуска: путь к программе мог измениться,
         // а задания из старых версий не запускались от батареи.
+        // Портативным копиям старые версии тоже ставили задание, такое задание убираем.
         if keep_task {
-            if let Err(e) = set_autostart_task(true, &p.log) {
-                p.log.push(format!("[prism] {e}"));
+            if installed {
+                if let Err(e) = set_autostart_task(true, &p.data, &p.log) {
+                    p.log.push(format!("[prism] {e}"));
+                }
+            } else {
+                let _ = set_autostart_task(false, &p.data, &p.log);
+                let mut i = p.inner.lock().unwrap();
+                i.settings.autostart = false;
+                p.save(&i);
+                p.log.push(format!("[prism] {AUTOSTART_PORTABLE}"));
             }
         }
 
@@ -843,4 +912,19 @@ fn main() {
             shutdown(app);
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn keeps_only_addresses() {
+        assert!(list_line("rutracker.org"));
+        assert!(list_line("203.0.113.113/32"));
+        assert!(list_line("2a00:1450::/32"));
+        assert!(!list_line("# Never leave this file empty"));
+        assert!(!list_line("--debug=@C:\\x"));
+        assert!(!list_line(""));
+    }
 }

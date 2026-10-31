@@ -76,6 +76,11 @@ jobs:
         with:
           workspaces: src-tauri
 
+      - name: Тесты
+        shell: pwsh
+        working-directory: src-tauri
+        run: cargo test
+
       - name: Собрать Prism
         shell: pwsh
         run: npx --yes @tauri-apps/cli@2 build
