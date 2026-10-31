@@ -217,8 +217,8 @@ async fn do_update_zapret(p: &Prism) -> R<bool> {
         i.engine.stop();
         r
     };
-    engine::kill_stray();
-    engine::unload_driver();
+    engine::kill_stray(&p.zapret);
+    engine::unload_driver(&p.zapret);
     tokio::time::sleep(Duration::from_millis(500)).await;
     let _ = std::fs::remove_dir_all(&old);
     std::fs::rename(&root, &old).map_err(|e| format!("Не удалось заменить файлы: {e}"))?;
@@ -309,8 +309,8 @@ async fn set_engine(p: State<'_, Prism>, on: bool) -> R<AppState> {
         start_engine(&p).await?;
     } else {
         p.inner.lock().unwrap().engine.stop();
-        engine::kill_stray();
-        engine::unload_driver();
+        engine::kill_stray(&p.zapret);
+        engine::unload_driver(&p.zapret);
     }
     {
         let mut i = p.inner.lock().unwrap();
@@ -691,12 +691,27 @@ fn show_main(app: &AppHandle) {
 
 fn shutdown(app: &AppHandle) {
     if let Some(p) = app.try_state::<Prism>() {
-        let mut i = p.inner.lock().unwrap();
-        i.engine.stop();
-        i.proxy.stop();
+        {
+            let mut i = p.inner.lock().unwrap();
+            i.engine.stop();
+            i.proxy.stop();
+        }
+        engine::kill_stray(&p.zapret);
+        engine::unload_driver(&p.zapret);
     }
-    engine::kill_stray();
-    engine::unload_driver();
+}
+
+/// Сообщить о том, из-за чего Prism не может работать, и закрыться.
+/// Без этого программа молча исчезала: окна ещё нет, а ошибка уходила в никуда.
+fn fatal(text: &str) -> ! {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK, MB_SETFOREGROUND};
+    let w = |s: &str| std::ffi::OsStr::new(s).encode_wide().chain(Some(0)).collect::<Vec<u16>>();
+    let body = format!("{text}
+
+Если ошибка повторяется, напишите о ней в https://github.com/{}/issues", updates::APP_REPO);
+    unsafe { MessageBoxW(std::ptr::null_mut(), w(&body).as_ptr(), w("Prism не запустился").as_ptr(), MB_OK | MB_ICONERROR | MB_SETFOREGROUND) };
+    std::process::exit(1)
 }
 
 /// Свои списки сайтов и подсетей, которые переносятся из прошлых версий.
@@ -889,7 +904,12 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
 fn main() {
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| show_main(app)))
-        .setup(setup)
+        .setup(|app| {
+            if let Err(e) = setup(app) {
+                fatal(&e.to_string());
+            }
+            Ok(())
+        })
         .on_window_event(|w, e| {
             if let WindowEvent::CloseRequested { api, .. } = e {
                 let tray = w.app_handle().try_state::<Prism>().map(|p| p.inner.lock().unwrap().settings.tray).unwrap_or(false);
@@ -905,7 +925,7 @@ fn main() {
             check_updates, update_zapret, update_app, set_auto_update
         ])
         .build(tauri::generate_context!())
-        .expect("ошибка запуска Prism");
+        .unwrap_or_else(|e| fatal(&format!("{e}. Возможно, не установлен Microsoft Edge WebView2.")));
 
     app.run(|app, e| {
         if let RunEvent::Exit = e {
