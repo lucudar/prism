@@ -1,6 +1,6 @@
 [package]
 name = "prism"
-version = "0.10.1"
+version = "0.11.0"
 description = "Prism: friendly GUI for zapret and Telegram proxy"
 edition = "2021"
 
@@ -17,6 +17,17 @@ tokio = { version = "1", features = ["time", "net", "macros"] }
 rand = "0.8"
 sha2 = "0.10"
 zip = { version = "2", default-features = false, features = ["deflate"] }
+windows-sys = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_Security_Authorization",
+  "Win32_Storage_FileSystem",
+  "Win32_System_Com",
+  "Win32_System_Diagnostics_ToolHelp",
+  "Win32_System_Threading",
+  "Win32_UI_Shell",
+  "Win32_UI_WindowsAndMessaging",
+] }
 
 [profile.release]
 codegen-units = 1

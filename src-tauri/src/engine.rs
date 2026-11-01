@@ -236,13 +236,91 @@ pub fn ensure_user_lists(paths: &ZapretPaths) {
     }
 }
 
-pub fn kill_stray() {
-    run_quiet("taskkill", &["/F", "/IM", "winws.exe"]);
+/// Запущенные winws.exe: номер процесса и полный путь к файлу (пустой, если не узнать).
+pub fn winws_processes() -> Vec<(u32, String)> {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
+    };
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    let mut out = Vec::new();
+    let snap = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snap == INVALID_HANDLE_VALUE {
+        return out;
+    }
+    let mut e: PROCESSENTRY32W = unsafe { std::mem::zeroed() };
+    e.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+    let mut more = unsafe { Process32FirstW(snap, &mut e) } != 0;
+    while more {
+        let len = e.szExeFile.iter().position(|&c| c == 0).unwrap_or(e.szExeFile.len());
+        if String::from_utf16_lossy(&e.szExeFile[..len]).eq_ignore_ascii_case("winws.exe") {
+            let mut path = String::new();
+            let h = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, e.th32ProcessID) };
+            if !h.is_null() {
+                let mut buf = [0u16; 1024];
+                let mut n = buf.len() as u32;
+                if unsafe { QueryFullProcessImageNameW(h, PROCESS_NAME_WIN32, buf.as_mut_ptr(), &mut n) } != 0 {
+                    path = String::from_utf16_lossy(&buf[..n as usize]);
+                }
+                unsafe { CloseHandle(h) };
+            }
+            out.push((e.th32ProcessID, path));
+        }
+        more = unsafe { Process32NextW(snap, &mut e) } != 0;
+    }
+    unsafe { CloseHandle(snap) };
+    out
+}
+
+/// Пути сравниваются без учёта регистра и префикса \\?\, который бывает у полных путей.
+fn same_file(a: &str, b: &Path) -> bool {
+    let plain = |s: &str| s.strip_prefix(r"\\?\").unwrap_or(s).to_lowercase();
+    !a.is_empty() && plain(a) == plain(&b.display().to_string())
+}
+
+/// Остановить winws.exe, оставшиеся от Prism (например, после аварийного закрытия).
+/// Чужие копии zapret не трогаем: раньше Prism закрывал вообще все winws.exe в системе.
+/// Ждём завершения, чтобы файлы движка можно было заменить.
+pub fn kill_stray(paths: &ZapretPaths) {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{OpenProcess, TerminateProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE};
+
+    let ours = paths.bin().join("winws.exe");
+    for (pid, path) in winws_processes() {
+        if !same_file(&path, &ours) {
+            continue;
+        }
+        let h = unsafe { OpenProcess(PROCESS_TERMINATE | PROCESS_SYNCHRONIZE, 0, pid) };
+        if !h.is_null() {
+            unsafe {
+                TerminateProcess(h, 1);
+                WaitForSingleObject(h, 3000);
+                CloseHandle(h);
+            }
+        }
+    }
+}
+
+/// Другие копии zapret, которые не дадут нашему обходу работать правильно.
+pub fn foreign_winws(paths: &ZapretPaths) -> Vec<String> {
+    let ours = paths.bin().join("winws.exe");
+    winws_processes()
+        .into_iter()
+        .filter(|(_, p)| !same_file(p, &ours))
+        .map(|(pid, p)| if p.is_empty() { format!("процесс {pid}") } else { p })
+        .collect()
 }
 
 /// Выгрузить драйвер WinDivert, когда обход выключен. Пока драйвер загружен,
-/// некоторые античиты не дают зайти в игру.
-pub fn unload_driver() {
+/// некоторые античиты не дают зайти в игру. Если работает другой zapret,
+/// драйвер нужен ему, и его не трогаем.
+pub fn unload_driver(paths: &ZapretPaths) {
+    if !foreign_winws(paths).is_empty() {
+        return;
+    }
     run_quiet("sc", &["stop", "WinDivert"]);
     run_quiet("sc", &["stop", "WinDivert14"]);
 }
@@ -258,10 +336,18 @@ impl Engine {
     pub fn start(&mut self, paths: &ZapretPaths, strategy: &str, games: bool, log: &Log) -> Result<(), String> {
         let keep = if self.alive() { self.since } else { None };
         self.stop();
-        kill_stray();
+        kill_stray(paths);
+        for other in foreign_winws(paths) {
+            log.push(format!("[prism] запущен другой zapret ({other}), из-за него обход может работать неправильно. Закройте его"));
+        }
         ensure_user_lists(paths);
         if games {
             ensure_game_lists(paths, log);
+        }
+        // Имя стратегии приходит из настроек и окна, поэтому берём только файл из списка:
+        // путь вида ..\другой.bat подсунул бы winws.exe чужие аргументы.
+        if !list_strategies(paths).iter().any(|s| s.id == strategy) {
+            return Err("Такой стратегии нет. Выберите другую.".into());
         }
         let bat = paths.strategies().join(strategy);
         let text = fs::read_to_string(&bat).map_err(|e| format!("Не удалось прочитать стратегию: {e}"))?;
@@ -328,7 +414,7 @@ pub fn install(resource: &Path, target: &Path, log: &Log) -> Result<(), String> 
     if has_engine && !crate::updates::newer(&src_ver, &dst_ver) {
         return Ok(());
     }
-    kill_stray();
+    kill_stray(&ZapretPaths { root: target.to_path_buf() });
     log.push(format!("[prism] установка файлов zapret {}", src_ver.trim()));
     copy_dir(resource, target).map_err(|e| format!("Не удалось скопировать файлы zapret: {e}"))
 }
@@ -388,5 +474,36 @@ mod tests {
         assert_eq!(a[8], "--new");
         let off = parse_bat(game, &p, false).unwrap();
         assert!(off.iter().all(|x| !x.contains(GAMES_IPSET) && !x.contains(GAMES_EXCLUDE)));
+    }
+}
+
+#[cfg(test)]
+mod kill_tests {
+    use super::*;
+
+    /// Копия ping.exe под именем winws.exe: живёт полминуты, как настоящий движок.
+    fn fake(root: &Path) -> std::process::Child {
+        let bin = root.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        fs::copy(crate::secure::system_dir().join("PING.EXE"), bin.join("winws.exe")).unwrap();
+        hidden(bin.join("winws.exe")).args(["-n", "30", "127.0.0.1"]).stdout(Stdio::null()).spawn().unwrap()
+    }
+
+    #[test]
+    fn kills_only_own_winws() {
+        // С префиксом \\?\ и без коротких имён: так проверяется и сравнение путей.
+        let base = std::env::temp_dir().canonicalize().unwrap().join("prism-kill-test");
+        let _ = fs::remove_dir_all(&base);
+        let ours = ZapretPaths { root: base.join("ours") };
+        let mut a = fake(&ours.root);
+        let mut b = fake(&base.join("other"));
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert_eq!(foreign_winws(&ours).iter().filter(|p| p.contains("prism-kill-test")).count(), 1);
+        kill_stray(&ours);
+        assert!(a.try_wait().unwrap().is_some(), "свой winws.exe должен быть остановлен");
+        assert!(b.try_wait().unwrap().is_none(), "чужой winws.exe трогать нельзя");
+        let _ = b.kill();
+        let _ = b.wait();
+        let _ = fs::remove_dir_all(&base);
     }
 }
