@@ -752,9 +752,6 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     let data = if installed { root } else { root.join("portable") };
     std::fs::create_dir_all(&data)?;
 
-    let cfg = app.config().app.windows.iter().find(|w| w.label == "main").cloned().ok_or("нет окна main")?;
-    tauri::WebviewWindowBuilder::from_config(app.handle(), &cfg)?.data_directory(data.join("webview")).build()?;
-
     let zapret = ZapretPaths { root: data.join("zapret") };
     if let Err(e) = engine::install(&res.join("zapret"), &zapret.root, &log) {
         log.push(format!("[prism] {e}"));
