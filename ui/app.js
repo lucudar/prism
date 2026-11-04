@@ -303,8 +303,8 @@ function render() {
   $('#tgMore').hidden = !S.tg_on || tgBad;
   if (!S.tg_on) $('#tgKv').hidden = true;
   $('#tgHost').textContent = S.tg.host; $('#tgPort').textContent = S.tg.port; $('#tgSecret').textContent = 'dd' + S.tg.secret;
-  $('#gmSub').textContent = !S.games ? 'Онлайн-игры и Discord. Вход в игры не ломает'
-    : on ? 'Работает. Лаунчеры и античиты не трогает' : 'Включится вместе с обходом';
+  $('#gmSub').textContent = !S.games ? 'Включайте, если игра тормозит или не заходит'
+    : on ? 'Работает. Если игра не заходит, выключите' : 'Включится вместе с обходом';
   $('#tgItem').classList.toggle('is-on', S.tg_on && !tgBad);
   $('#gmItem').classList.toggle('is-on', S.games);
   $('#aiItem').classList.toggle('is-on', S.ai);

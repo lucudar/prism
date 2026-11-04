@@ -692,6 +692,9 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     if let Err(e) = engine::install(&res.join("zapret"), &zapret.root, &log) {
         log.push(format!("[prism] {e}"));
     }
+    // Программы, которые мешают zapret, Prism только называет в журнале.
+    let diag = log.clone();
+    std::thread::spawn(move || engine::diagnose(&diag));
     let settings_file = data.join("settings.json");
     let mut settings = Settings::load(&settings_file);
     if settings.tg_secret.len() != 32 {
