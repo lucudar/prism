@@ -303,9 +303,9 @@ pub fn enable_tcp_timestamps(log: &Log) {
         return;
     }
     if run_quiet("netsh", &["interface", "tcp", "set", "global", "timestamps=enabled"]) {
-        log.push("[prism] метки времени TCP включены (нужны стратегиям с fooling=ts)");
+        log.pin("[prism] метки времени TCP включены (нужны стратегиям с fooling=ts)");
     } else {
-        log.push("[prism] не удалось включить метки времени TCP, стратегии с fooling=ts могут не работать");
+        log.pin("[prism] не удалось включить метки времени TCP, стратегии с fooling=ts могут не работать");
     }
 }
 
@@ -364,29 +364,65 @@ fn vpn_services(services: &str) -> Vec<String> {
     out
 }
 
-/// Есть ли в файле hosts свои адреса для YouTube: с ними видео часто не грузится.
-fn hosts_youtube(text: &str) -> bool {
-    text.lines().map(str::trim).filter(|l| !l.starts_with('#')).any(|l| {
-        let l = l.to_lowercase();
-        l.contains("youtube.com") || l.contains("youtu.be") || l.contains("googlevideo.com")
-    })
+/// Строки файла hosts с адресами YouTube: с ними видео часто не грузится.
+fn hosts_youtube(text: &str) -> Vec<String> {
+    const NAMES: [&str; 6] = ["youtube.com", "youtu.be", "googlevideo.com", "ytimg.com", "ggpht.com", "youtubei.googleapis.com"];
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .filter(|l| {
+            let low = l.to_lowercase();
+            NAMES.iter().any(|n| low.contains(*n))
+        })
+        .take(5)
+        .map(str::to_string)
+        .collect()
+}
+
+/// Сборка Windows и DNS-серверы IPv4 из настроек сети. По ним в журнале видно,
+/// чей DNS спрашивает браузер: провайдера, роутера или публичный.
+fn system_info() -> (String, Vec<String>) {
+    let script = "$d = (Get-DnsClientServerAddress -AddressFamily IPv4).ServerAddresses | Sort-Object -Unique; [Environment]::OSVersion.Version.Build.ToString() + '|' + ($d -join ',')";
+    let out = output("powershell", &["-NoProfile", "-NonInteractive", "-Command", script]);
+    let line = out.lines().find(|l| l.contains('|')).unwrap_or("").trim();
+    let (build, servers) = line.split_once('|').unwrap_or(("", ""));
+    let dns: Vec<String> = servers.split(',').map(str::trim).filter(|s| !s.is_empty()).map(str::to_string).collect();
+    (build.trim().to_string(), dns)
+}
+
+/// Установлен ли Яндекс Браузер. В нём не выбрать безопасный DNS Google или Cloudflare
+/// (Flowseal, issue #6083), и YouTube может писать «Нет подключения к интернету».
+fn yandex_browser() -> bool {
+    std::env::var_os("LOCALAPPDATA")
+        .map(|d| Path::new(&d).join("Yandex").join("YandexBrowser").join("Application").join("browser.exe").exists())
+        .unwrap_or(false)
 }
 
 /// Проверить, что мешает обходу. Только пишет в журнал и ничего не меняет.
+/// Строки закрепляются в начале журнала, чтобы их не вытеснил вывод движка.
 pub fn diagnose(log: &Log) {
+    let (build, dns) = system_info();
+    let build = if build.is_empty() { "неизвестна".to_string() } else { build };
+    log.pin(format!("[prism] Prism {}, сборка Windows: {build}", env!("CARGO_PKG_VERSION")));
+    let dns = if dns.is_empty() { "не удалось узнать".to_string() } else { dns.join(", ") };
+    log.pin(format!("[prism] DNS-серверы Windows: {dns}"));
     let services = output("sc", &["query"]);
     for name in conflicts(&services) {
-        log.push(format!("[prism] найдено: {name}. Эта программа мешает zapret: если обход не работает, отключите её"));
+        log.pin(format!("[prism] найдено: {name}. Эта программа мешает zapret: если обход не работает, отключите её"));
     }
     if output("tasklist", &["/FI", "IMAGENAME eq AdguardSvc.exe"]).to_lowercase().contains("adguardsvc.exe") {
-        log.push("[prism] запущен Adguard. Он может мешать Discord и YouTube: если они не открываются, выключите его");
+        log.pin("[prism] запущен Adguard. Он может мешать Discord и YouTube: если они не открываются, выключите его");
     }
     let vpn = vpn_services(&services);
     if !vpn.is_empty() {
-        log.push(format!("[prism] найдены службы VPN: {}. Если обход не работает, выключите VPN", vpn.join(", ")));
+        log.pin(format!("[prism] найдены службы VPN: {}. Если обход не работает, выключите VPN", vpn.join(", ")));
     }
-    if hosts_youtube(&fs::read_to_string(crate::hosts::hosts_path()).unwrap_or_default()) {
-        log.push("[prism] в файле hosts есть адреса YouTube. Из-за них видео может не грузиться, уберите эти строки");
+    let hosts = hosts_youtube(&fs::read_to_string(crate::hosts::hosts_path()).unwrap_or_default());
+    if !hosts.is_empty() {
+        log.pin(format!("[prism] в файле hosts есть адреса YouTube: {}. Из-за них видео может не грузиться, уберите эти строки", hosts.join("; ")));
+    }
+    if yandex_browser() {
+        log.pin("[prism] установлен Яндекс Браузер. Если YouTube в нём пишет «Нет подключения к интернету», откройте YouTube в Chrome, Edge или Firefox с безопасным DNS");
     }
 }
 
@@ -601,7 +637,7 @@ mod tests {
         let ru = "Имя_службы: ProtonVPN Service\r\nВыводимое_имя: Proton VPN\r\n        Тип                : 10  WIN32_OWN_PROCESS\r\n\r\nИмя_службы: HappService\r\nВыводимое_имя: Happ\r\n\r\nИмя_службы: Dnscache\r\nВыводимое_имя: DNS-клиент\r\n";
         assert!(conflicts(ru).is_empty());
         assert_eq!(vpn_services(ru), vec!["ProtonVPN Service", "HappService"]);
-        assert!(hosts_youtube("127.0.0.1 localhost\r\n1.2.3.4 www.youtube.com\r\n"));
-        assert!(!hosts_youtube("# 1.2.3.4 youtube.com\r\n5.6.7.8 chatgpt.com\r\n"));
+        assert_eq!(hosts_youtube("127.0.0.1 localhost\r\n1.2.3.4 www.youtube.com\r\n"), vec!["1.2.3.4 www.youtube.com"]);
+        assert!(hosts_youtube("# 1.2.3.4 youtube.com\r\n5.6.7.8 chatgpt.com\r\n").is_empty());
     }
 }
