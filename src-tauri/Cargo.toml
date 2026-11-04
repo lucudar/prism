@@ -1,6 +1,6 @@
 [package]
 name = "prism"
-version = "0.10.1"
+version = "0.10.2"
 description = "Prism: friendly GUI for zapret and Telegram proxy"
 edition = "2021"
 

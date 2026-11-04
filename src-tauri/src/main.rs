@@ -40,11 +40,25 @@ struct Prism {
     tg_exe: PathBuf,
     settings_file: PathBuf,
     hosts_cache: PathBuf,
+    /// Последний итог проверки DNS для YouTube: в журнал пишем, только когда он меняется.
+    dns_note: Mutex<&'static str>,
 }
 
 impl Prism {
     fn save(&self, i: &Inner) {
         i.settings.save(&self.settings_file);
+    }
+
+    /// Записать в журнал итог проверки DNS. Проверка на главной идёт каждую минуту,
+    /// поэтому строки повторяются, только когда итог изменился или их просит подбор.
+    fn note_dns(&self, d: &probe::DnsCheck, always: bool) {
+        let mut last = self.dns_note.lock().unwrap();
+        if always || *last != d.kind {
+            *last = d.kind;
+            for line in &d.lines {
+                self.log.push(line.clone());
+            }
+        }
     }
 }
 
@@ -442,18 +456,38 @@ struct Status {
     youtube: probe::Check,
     telegram: probe::Check,
     chatgpt: bool,
+    /// YouTube открывается только по адресу от безопасного DNS: в браузере
+    /// с DNS провайдера он пишет «Нет подключения к интернету».
+    youtube_dns: bool,
 }
 
 #[tauri::command]
 async fn check_services(p: State<'_, Prism>) -> R<Status> {
-    let (port, ai) = {
-        let i = p.inner.lock().unwrap();
-        (i.settings.tg_port, i.settings.ai)
+    let (port, ai, on) = {
+        let mut i = p.inner.lock().unwrap();
+        let on = i.engine.alive();
+        (i.settings.tg_port, i.settings.ai, on)
     };
-    let s = probe::services(6).await;
+    let dns = probe::Dns::cached().await;
+    // Адреса YouTube сравниваем только с включённым обходом: без него
+    // YouTube не открывается ни по какому адресу.
+    let dns_check = async {
+        if on {
+            Some(probe::youtube_dns(&dns, 6).await)
+        } else {
+            None
+        }
+    };
+    let (s, d) = tokio::join!(probe::services(6, &dns), dns_check);
     let telegram = probe::tcp(port).await;
     let chatgpt = ai && std::fs::read_to_string(hosts::hosts_path()).map(|t| t.contains("Prism: нейросети")).unwrap_or(false);
-    Ok(Status { discord: s.discord, youtube: s.youtube, telegram, chatgpt })
+    let youtube_dns = d
+        .map(|d| {
+            p.note_dns(&d, false);
+            d.bad
+        })
+        .unwrap_or(false);
+    Ok(Status { discord: s.discord, youtube: s.youtube, telegram, chatgpt, youtube_dns })
 }
 
 #[derive(Clone, Serialize)]
@@ -474,6 +508,14 @@ async fn auto_pick(app: AppHandle, p: State<'_, Prism>) -> R<AppState> {
     }
     let list = engine::list_strategies(&p.zapret);
     let previous = p.inner.lock().unwrap().settings.strategy.clone();
+    // YouTube проверяем по адресам от безопасного DNS: так стратегии сравниваются
+    // по тому, как они обходят блокировку, а не по ответу DNS провайдера.
+    let dns = probe::Dns::lookup().await;
+    p.log.push(if dns.is_empty() {
+        "[prism] безопасный DNS не ответил, YouTube проверяется по адресам от DNS Windows"
+    } else {
+        "[prism] YouTube проверяется по адресам от безопасного DNS (Google, Cloudflare)"
+    });
     let mut best: Option<(usize, u64, String)> = None;
     for s in &list {
         let _ = app.emit("pick-progress", Progress { id: s.id.clone(), state: "wait", ms: 0 });
@@ -482,20 +524,20 @@ async fn auto_pick(app: AppHandle, p: State<'_, Prism>) -> R<AppState> {
         // Оценка важнее «работает/не работает»: для YouTube считаем, сколько адресов
         // ответило из проверенных. Стратегия, где открывается сайт, но не видео, хуже.
         let (score, ms, failed_yt) = if started {
-            let mut r = probe::services(4).await;
+            let mut r = probe::services(4, &dns).await;
             // Сразу после перезапуска движка часть соединений ещё не поднялась.
             // Нулевой результат повторяем один раз, чтобы не отбросить рабочую стратегию.
             if !r.discord.ok && !r.youtube.ok {
                 tokio::time::sleep(Duration::from_millis(900)).await;
-                r = probe::services(4).await;
+                r = probe::services(4, &dns).await;
             }
             let svc = [&r.discord, &r.youtube];
             let ok = svc.iter().filter(|x| x.ok).count();
             let adr = svc.iter().map(|x| x.good as usize).sum::<usize>();
             let ms = if ok > 0 { (r.discord.ms + r.youtube.ms) / ok as u64 } else { 0 };
-            // Что именно не открылось: сайт, видеосервер или api.
+            // Что именно не открылось и почему: сайт, видеосервер или api.
             let failed = if r.youtube.total > r.youtube.good {
-                probe::youtube_failed(&probe::client(4)).await
+                probe::youtube_failed(&dns.client(4)).await
             } else {
                 Vec::new()
             };
@@ -528,6 +570,8 @@ async fn auto_pick(app: AppHandle, p: State<'_, Prism>) -> R<AppState> {
     }
     let result = start_engine(&p).await;
     result?;
+    // Итог для журнала: открывается ли YouTube по адресу от DNS Windows.
+    p.note_dns(&probe::youtube_dns(&dns, 5).await, true);
     Ok(snapshot(&p))
 }
 
@@ -692,6 +736,9 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     if let Err(e) = engine::install(&res.join("zapret"), &zapret.root, &log) {
         log.push(format!("[prism] {e}"));
     }
+    // Программы, которые мешают zapret, Prism только называет в журнале.
+    let diag = log.clone();
+    std::thread::spawn(move || engine::diagnose(&diag));
     let settings_file = data.join("settings.json");
     let mut settings = Settings::load(&settings_file);
     if settings.tg_secret.len() != 32 {
@@ -715,6 +762,7 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         tg_exe: res.join("tgproxy").join("tg-ws-proxy.exe"),
         settings_file,
         hosts_cache: data.join("ai-hosts.txt"),
+        dns_note: Mutex::new(""),
     });
 
     // Трей
