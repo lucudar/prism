@@ -14,6 +14,11 @@ pub fn new_secret() -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
+/// Секрет передаётся прокси в командной строке, поэтому принимаем только 32 hex-символа.
+pub fn valid_secret(s: &str) -> bool {
+    s.len() == 32 && s.chars().all(|c| c.is_ascii_hexdigit())
+}
+
 pub fn link(port: u16, secret: &str) -> String {
     format!("tg://proxy?server={HOST}&port={port}&secret=dd{secret}")
 }
@@ -59,5 +64,18 @@ impl Proxy {
             let _ = c.kill();
             let _ = c.wait();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn checks_secret() {
+        assert!(valid_secret(&new_secret()));
+        assert!(!valid_secret("0123456789abcdef0123456789abcde"));
+        assert!(!valid_secret("0123456789abcdef0123456789abcde --x"));
+        assert!(!valid_secret("0123456789abcdef0123456789abcdeg"));
     }
 }
