@@ -179,8 +179,9 @@ impl Dns {
     pub async fn lookup() -> Dns {
         let c = doh_client();
         let [a, b, d] = YOUTUBE.map(|(_, host, _)| host);
-        let (ia, ib, id) = tokio::join!(doh(&c, a), doh(&c, b), doh(&c, d));
-        let dns = Dns([(a, ia), (b, ib), (d, id)].into_iter().filter(|(_, ips)| !ips.is_empty()).collect());
+        // Картинки тоже: их проверка обязательна, и DNS провайдера не должен её валить.
+        let (ia, ib, id, ii) = tokio::join!(doh(&c, a), doh(&c, b), doh(&c, d), doh(&c, YT_IMG));
+        let dns = Dns([(a, ia), (b, ib), (d, id), (YT_IMG, ii)].into_iter().filter(|(_, ips)| !ips.is_empty()).collect());
         *DNS_CACHE.lock().unwrap() = Some((Instant::now(), dns.clone()));
         dns
     }
@@ -310,6 +311,7 @@ const DISCORD: [Probe<'static>; 4] = [
 /// Картинка с i.ytimg.com больше 16 КБ: на ней видно, что DPI не замораживает
 /// соединение посередине, как бывает с видео. Сам поток googlevideo без подписи
 /// плеера не скачать, поэтому проверяем так.
+const YT_IMG: &str = "i.ytimg.com";
 const YT_BULK: &str = "https://i.ytimg.com/vi/dQw4w9WgXcQ/maxresdefault.jpg";
 const YT_BULK_MIN: usize = 24 * 1024;
 
@@ -458,5 +460,7 @@ mod tests {
         assert!(tally(&opt, &[Err("x".into()), Ok((5, 0))]).ok);
         assert!(!tally(&opt, &[Err("x".into()), Err("y".into())]).ok);
         assert!(DISCORD.iter().filter(|p| p.need).count() == 2);
+        // Адрес картинки спрашивается у безопасного DNS вместе с остальными адресами YouTube.
+        assert!(YT_BULK.starts_with(&format!("https://{YT_IMG}/")));
     }
 }
