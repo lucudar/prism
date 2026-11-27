@@ -24,6 +24,13 @@
 html,body{height:100%;margin:0}
 body{font:400 14.5px/1.5 Onest,"Segoe UI",sans-serif;color:var(--fg);background:var(--bg);overflow:hidden;user-select:none;-webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale;font-variant-numeric:tabular-nums;letter-spacing:-.005em}
 body::before{content:"";position:fixed;inset:-20% -20% auto;height:70%;pointer-events:none;background:radial-gradient(60% 100% at 50% 0,rgba(255,255,255,.055),transparent 70%);z-index:0}
+/* Windows 11: эффект Mica. Фон окна полупрозрачный, сквозь него едва видны обои.
+   Тёмная подложка остаётся плотной, поэтому текст такой же контрастный. В Windows 10
+   класса mica нет, и окно целиком непрозрачное. */
+body.mica{background:rgba(7,7,8,.72)}
+body.mica .top{background:rgba(7,7,8,.5)}
+body.mica .group{background:linear-gradient(180deg,rgba(13,13,15,.82),rgba(13,13,15,.5))}
+body.mica .panel{background:rgba(13,13,15,.8)}
 button{font:inherit;color:inherit}
 :focus-visible{outline:1px solid var(--fg);outline-offset:3px;border-radius:6px}
 [hidden]{display:none!important}
@@ -287,7 +294,7 @@ dialog::backdrop{background:rgba(0,0,0,.74);backdrop-filter:blur(6px)}
           <div class="row svc off" id="svc-dc"><div class="t"><b>Discord</b></div><span class="st"><i class="dot"></i><span id="st-dc">Выключено</span></span></div>
           <div class="row svc off" id="svc-yt"><div class="t"><b>YouTube</b></div><span class="st"><i class="dot"></i><span id="st-yt">Выключено</span></span></div>
           <div class="row strat" id="stratRow">
-            <div class="t"><span class="k">Стратегия</span><b id="stratName">Основная</b></div>
+            <div class="t"><span class="k">Стратегия</span><b id="stratName">Основная</b><span id="stratNet" hidden></span></div>
             <button class="btn ghost" id="stratOpen">Выбрать</button>
             <button class="btn" id="pickBtn">Подобрать</button>
           </div>
@@ -339,7 +346,11 @@ dialog::backdrop{background:rgba(0,0,0,.74);backdrop-filter:blur(6px)}
     <div class="label">Запуск</div>
     <div class="panel">
       <div class="item"><div class="row"><div class="t"><b>Автозапуск</b><span class="asSub">Включать обход при запуске Windows</span></div><button class="sw" role="switch" aria-checked="false" data-mod="autostart" aria-label="Автозапуск"></button></div></div>
-      <div class="item"><div class="row"><div class="t"><b>Сворачивать в трей</b><span>Крестик прячет окно, а обход продолжает работать</span></div><button class="sw" role="switch" aria-checked="true" data-mod="tray" aria-label="Сворачивать в трей"></button></div></div>
+      <div class="item"><div class="row"><div class="t"><b>Сворачивать в трей</b><span>Крестик прячет окно, а обход продолжает работать. В меню значка можно включить и выключить обход</span></div><button class="sw" role="switch" aria-checked="true" data-mod="tray" aria-label="Сворачивать в трей"></button></div></div>
+    </div>
+    <div class="label" id="lookLabel" hidden>Вид</div>
+    <div class="panel" id="lookPanel" hidden>
+      <div class="item"><div class="row"><div class="t"><b>Прозрачный фон</b><span>Эффект Mica из Windows 11: сквозь окно чуть видны обои</span></div><button class="sw" role="switch" aria-checked="true" data-mod="mica" aria-label="Прозрачный фон"></button></div></div>
     </div>
     <div class="label">Обновления</div>
     <div class="panel">
@@ -355,7 +366,7 @@ dialog::backdrop{background:rgba(0,0,0,.74);backdrop-filter:blur(6px)}
 
 <dialog id="stratDlg" aria-labelledby="dlgTitle">
   <div class="dlg-h"><h3 id="dlgTitle">Стратегия</h3><button class="x" id="dlgClose" aria-label="Закрыть"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M6 6l12 12M18 6 6 18"/></svg></button></div>
-  <p class="dlg-sub">Провайдеры блокируют по-разному. Если не знаете, какую выбрать, нажмите «Подобрать» на главной: Prism проверит все и включит самую быструю.</p>
+  <p class="dlg-sub">Провайдеры блокируют по-разному. Если не знаете, какую выбрать, нажмите «Подобрать» на главной: Prism проверит все и включит самую быструю. Выбранная стратегия запоминается для текущей сети.</p>
   <div class="dlg-list" id="strats" role="radiogroup" aria-label="Стратегии"></div>
 </dialog>
 
