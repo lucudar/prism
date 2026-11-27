@@ -7,26 +7,28 @@ const mock = (() => {
   const st = { engine_on:false, strategy:'general.bat', games:false, ai:false, tg_on:false, autostart:false, tray:true,
     tg:{host:'127.0.0.1',port:1443,secret:'7f3a9c41e0b25d88f6c1a04e93b7d2aa',link:'tg://proxy?server=127.0.0.1&port=1443&secret=dd7f3a9c41e0b25d88f6c1a04e93b7d2aa'},
     strategies:[['general.bat','Основная','Рекомендуемая, начните с неё'],['general (ALT).bat','ALT','Альтернативная разрезка пакетов'],['general (ALT2).bat','ALT2','Альтернативная разрезка пакетов'],['general (FAKE TLS AUTO).bat','FAKE TLS AUTO','Поддельное TLS-приветствие, часто помогает на мобильном интернете'],['general (SIMPLE FAKE).bat','SIMPLE FAKE','Простые фейковые пакеты']].map(([id,name,desc])=>({id,name,desc})),
-    since:0, user_sites:['rutracker.org','nnmclub.to'], builtin_sites:142, auto_update:true, app_version:'0.5.0', zapret_version:'1.10.3', portable:false, versions:['zapret-discord-youtube 1.10.3 (winws из zapret v72.9)','tg-ws-proxy 1.11.1'] };
+    since:0, user_sites:['rutracker.org','nnmclub.to'], builtin_sites:142, auto_update:true, app_version:'0.5.0', zapret_version:'1.10.3', portable:false, versions:['zapret-discord-youtube 1.10.3 (winws из zapret v72.9)','tg-ws-proxy 1.11.1'],
+    network:'Home-WiFi', profile:true, mica:false, mica_ok:false };
   const wait = ms => new Promise(r => setTimeout(r, ms));
   let stopFlag = false;
   return async (cmd, a = {}) => {
     await wait(300);
     switch (cmd) {
       case 'set_engine': await wait(a.on ? 1200 : 300); st.engine_on = a.on; st.since = a.on ? Date.now() - 2 * 3600e3 - 14 * 60e3 : 0; break;
-      case 'set_strategy': st.strategy = a.id; break;
+      case 'set_strategy': st.strategy = a.id; st.profile = true; break;
       case 'set_games': st.games = a.on; break;
       case 'set_ai': st.ai = a.on; break;
       case 'set_tg': st.tg_on = a.on; break;
       case 'set_autostart': st.autostart = a.on; break;
       case 'set_tray': st.tray = a.on; break;
+      case 'set_mica': st.mica = a.on; break;
       case 'add_site': st.user_sites.unshift(a.domain); break;
       case 'remove_site': st.user_sites = st.user_sites.filter(s => s !== a.domain); break;
       case 'check_services': await wait(900); return { discord:{ok:st.engine_on,ms:120,good:2,total:2}, youtube:{ok:st.engine_on,ms:140,good:3,total:3}, telegram:{ok:st.tg_on,ms:1,good:0,total:0}, chatgpt:st.ai, youtube_dns:false };
       case 'auto_pick':
         stopFlag = false;
         for (const s of st.strategies) { if (stopFlag) break; emit('pick-progress',{id:s.id,state:'wait',ms:0}); await wait(400); emit('pick-progress',{id:s.id,state:s.id.includes('ALT2')?'bad':'ok',ms:100+Math.round(Math.random()*150)}); }
-        st.strategy = 'general.bat'; st.engine_on = true; st.since = Date.now(); break;
+        st.strategy = 'general.bat'; st.engine_on = true; st.since = Date.now(); st.profile = true; break;
       case 'stop_pick': stopFlag = true; return null;
       case 'get_log': return '[prism] предпросмотр в браузере';
       case 'set_auto_update': st.auto_update = a.on; break;
@@ -118,7 +120,7 @@ powerBtn.onclick = async () => {
 };
 
 // Остальные переключатели
-const modCmd = { tg:'set_tg', games:'set_games', ai:'set_ai', autostart:'set_autostart', tray:'set_tray', auto_update:'set_auto_update' };
+const modCmd = { tg:'set_tg', games:'set_games', ai:'set_ai', autostart:'set_autostart', tray:'set_tray', auto_update:'set_auto_update', mica:'set_mica' };
 const modText = {
   tg: on => on ? 'Прокси для Telegram включён' : 'Прокси для Telegram выключен',
   games: on => on ? 'Режим для игр включён' : 'Режим для игр выключен',
@@ -126,8 +128,9 @@ const modText = {
   autostart: on => on ? 'Автозапуск включён' : 'Автозапуск выключен',
   tray: on => on ? 'Крестик будет сворачивать в трей' : 'Крестик будет закрывать Prism',
   auto_update: on => on ? 'Автообновление включено' : 'Автообновление выключено',
+  mica: on => on ? 'Прозрачный фон включён' : 'Прозрачный фон выключен',
 };
-const modVal = { tg: () => S.tg_on, games: () => S.games, ai: () => S.ai, autostart: () => S.autostart, tray: () => S.tray, auto_update: () => S.auto_update };
+const modVal = { tg: () => S.tg_on, games: () => S.games, ai: () => S.ai, autostart: () => S.autostart, tray: () => S.tray, auto_update: () => S.auto_update, mica: () => S.mica };
 // Эти переключатели перезапускают движок и сбили бы подбор.
 const engineMods = ['games'];
 $$('.sw[data-mod]').forEach(sw => sw.onclick = async () => {
@@ -204,13 +207,15 @@ $('#pickBtn').onclick = async () => {
   for (const k in pick) if (pick[k].state === 'wait') delete pick[k];
   picking = false; stopping = false; invalidate(); render(); checkSoon();
 };
+// «Подобрать стратегию» в меню значка в трее: Prism открывает окно и сразу начинает.
+listen('tray-pick', () => { go('home'); if (S && !picking && !busy) $('#pickBtn').click(); });
 
 // Сайты
 function drawSites() {
   const list = S.user_sites;
   $('#sites').innerHTML = list.map(s => `<div class="row"><div class="t"><b>${esc(s)}</b></div><button class="x" data-del="${esc(s)}" aria-label="Убрать ${esc(s)}"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M6 6l12 12M18 6 6 18"/></svg></button></div>`).join('')
     || '<div class="empty">Здесь пока пусто. Добавьте сайт, который не открывается.</div>';
-  $('#builtin').textContent = `Ещё ${S.builtin_sites} сайтов уже есть во встроенном списке: Discord, YouTube и другие.`;
+  $('#builtin').textContent = `Ещё ${S.builtin_sites} сайтов уже есть во встроенном списке: Discord, YouTube и другие. Первые три сайта из вашего списка проверяет подбор.`;
   $$('[data-del]').forEach(b => b.onclick = () => call('remove_site', { domain: b.dataset.del }, `${b.dataset.del} убран из списка`).catch(() => {}));
 }
 $('#addForm').onsubmit = async e => {
@@ -277,6 +282,7 @@ function render() {
   document.body.classList.toggle('on', busyText ? !!target : on);
   document.body.classList.toggle('busy', !!busyText);
   document.body.classList.toggle('pick', picking);
+  document.body.classList.toggle('mica', !!(S.mica && S.mica_ok));
   const pw = $('#power');
   pw.setAttribute('aria-checked', busyText ? !!target : on);
   pw.disabled = busy || picking;
@@ -315,6 +321,10 @@ function render() {
   const cur = S.strategies.find(x => pick[x.id] && pick[x.id].state === 'wait');
   $('#stratName').textContent = !total ? 'Не найдены. Переустановите Prism'
     : picking ? (cur ? `Проверяю «${cur.name}»` : 'Готовлю проверку') : (strat ? strat.name : S.strategy);
+  // Сеть, для которой запомнена стратегия: в другой сети Prism включит свою.
+  const sn = $('#stratNet');
+  sn.hidden = picking || !S.network;
+  sn.textContent = S.profile ? `Запомнена для сети «${S.network}»` : `Сеть «${S.network}»`;
   $('#arc').style.strokeDasharray = picking ? `${Math.max(2, Math.round(done / Math.max(total, 1) * 100))} 100` : '';
   const pb = $('#pickBtn');
   pb.textContent = picking ? (stopping ? 'Останавливаю…' : 'Стоп') : 'Подобрать';
@@ -341,6 +351,8 @@ function render() {
   $$('.asSub').forEach(el => el.textContent = S.autostart ? 'Включится сам при запуске Windows' : 'Включать обход при запуске Windows');
   $('#aiSub').textContent = S.ai ? 'Работают без VPN, даже когда Prism закрыт'
     : 'ChatGPT, Gemini, Claude и другие без VPN';
+  // Прозрачный фон есть только в Windows 11.
+  $('#lookLabel').hidden = $('#lookPanel').hidden = !S.mica_ok;
 
   drawUpdates();
   drawSites();
@@ -385,8 +397,8 @@ $('#zapUpd').onclick = async e => {
 };
 listen('updates', e => { U = e.payload; drawUpdates(); });
 listen('zapret-updated', e => toast(`Обходы обновлены до версии ${e.payload}`));
-// Сторож выключил обход: winws.exe падал несколько раз подряд.
-listen('engine-crashed', e => toast(String(e.payload)));
+// Сообщения от программы: сторож выключил обход, сменилась сеть и так далее.
+listen('notice', e => toast(String(e.payload)));
 
 listen('state-changed', () => refresh().then(checkSoon));
 refresh().then(checkSoon);
