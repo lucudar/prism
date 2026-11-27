@@ -2,7 +2,7 @@
 //! записываются в файл hosts Windows. Берём только разделы с нейросетями.
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use crate::util::run_quiet;
 
@@ -12,8 +12,7 @@ const END: &str = "# <<< Prism";
 const SECTIONS: &[&str] = &["OpenAI", "Microsoft", "GitHub Copilot", "ElevenLabs", "Grok", "DeepL", "Google", "Claude"];
 
 pub fn hosts_path() -> PathBuf {
-    let root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".into());
-    Path::new(&root).join("System32").join("drivers").join("etc").join("hosts")
+    crate::secure::system_dir().join("drivers").join("etc").join("hosts")
 }
 
 /// Оставить из списка только нужные разделы и строки «IP домен».
@@ -44,21 +43,37 @@ pub fn filter_list(raw: &str) -> String {
     out.join("\r\n")
 }
 
+/// Строка, которую Prism мог записать в свой блок: заголовок раздела или «IP домен».
+fn block_line(line: &str) -> bool {
+    let t = line.trim();
+    if let Some(name) = t.strip_prefix("# ") {
+        return SECTIONS.iter().any(|s| s.eq_ignore_ascii_case(name.trim()));
+    }
+    let mut it = t.split_whitespace();
+    matches!((it.next(), it.next(), it.next()), (Some(ip), Some(host), None) if ip.parse::<std::net::IpAddr>().is_ok() && host.contains('.'))
+}
+
 fn strip_block(text: &str) -> String {
+    let lines: Vec<&str> = text.lines().collect();
     let mut out = Vec::new();
-    let mut inside = false;
-    for line in text.lines() {
-        if line.trim() == START {
-            inside = true;
+    let mut i = 0;
+    while i < lines.len() {
+        if lines[i].trim() != START {
+            out.push(lines[i]);
+            i += 1;
             continue;
         }
-        if inside {
-            if line.trim() == END {
-                inside = false;
+        match lines[i + 1..].iter().position(|l| l.trim() == END) {
+            Some(n) => i += n + 2,
+            // Конец блока стёрли вручную: убираем только строки, похожие на наши,
+            // и останавливаемся на первой чужой, чтобы не стереть остаток файла.
+            None => {
+                i += 1;
+                while i < lines.len() && block_line(lines[i]) {
+                    i += 1;
+                }
             }
-            continue;
         }
-        out.push(line);
     }
     while out.last().map(|l| l.trim().is_empty()).unwrap_or(false) {
         out.pop();
@@ -76,7 +91,7 @@ fn write_hosts(body: &str) -> Result<(), String> {
             let _ = fs::set_permissions(&p, perm);
         }
     }
-    fs::write(&p, body).map_err(|e| {
+    crate::util::write_atomic(&p, body).map_err(|e| {
         format!("Не удалось изменить файл hosts: {e}. Возможно, его блокирует антивирус.")
     })?;
     run_quiet("ipconfig", &["/flushdns"]);
@@ -135,5 +150,13 @@ mod tests {
     fn strips_block() {
         let t = format!("127.0.0.1 localhost\r\n\r\n{START}\r\n1.1.1.1 a.com\r\n{END}\r\n");
         assert_eq!(strip_block(&t), "127.0.0.1 localhost");
+        let mid = format!("1.1.1.1 a.com\r\n{START}\r\n# OpenAI\r\n2.2.2.2 chatgpt.com\r\n{END}\r\n3.3.3.3 b.com\r\n");
+        assert_eq!(strip_block(&mid), "1.1.1.1 a.com\r\n3.3.3.3 b.com");
+    }
+
+    #[test]
+    fn keeps_rest_without_end_marker() {
+        let t = format!("127.0.0.1 localhost\r\n{START}\r\n# OpenAI\r\n2.2.2.2 chatgpt.com\r\n\r\n# Моё\r\n10.0.0.5 nas.local\r\n");
+        assert_eq!(strip_block(&t), "127.0.0.1 localhost\r\n\r\n# Моё\r\n10.0.0.5 nas.local");
     }
 }
