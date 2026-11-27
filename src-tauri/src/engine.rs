@@ -575,6 +575,16 @@ impl Engine {
         }
     }
 
+    /// Движок был запущен и сам завершился (упал или его закрыли извне):
+    /// код выхода для журнала. После stop() движок считается выключенным, а не упавшим.
+    pub fn exited(&mut self) -> Option<String> {
+        let status = self.child.as_mut()?.try_wait().ok()??;
+        Some(match status.code() {
+            Some(c) => format!("код {c}"),
+            None => "без кода".into(),
+        })
+    }
+
     /// Время включения в миллисекундах с 1970 года или 0, если обход не работает.
     pub fn since_ms(&mut self) -> u64 {
         if !self.alive() {

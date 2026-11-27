@@ -15,6 +15,9 @@ pub struct Check {
     /// страница может открываться, а видео с googlevideo.com — нет.
     pub good: u8,
     pub total: u8,
+    /// Какие адреса не открылись и почему. Только для журнала, в окно не уходит.
+    #[serde(skip)]
+    pub failed: Vec<String>,
 }
 
 fn builder(timeout: u64) -> reqwest::ClientBuilder {
@@ -61,6 +64,7 @@ async fn fetch(c: &reqwest::Client, url: &str) -> Result<u64, String> {
 
 /// Один адрес отвечает, если получили любой HTTP-ответ: DPI чаще режет
 /// соединение или молчит, чем отдаёт ошибку по существу.
+#[allow(dead_code)]
 pub async fn http(c: &reqwest::Client, url: &str) -> Check {
     match fetch(c, url).await {
         Ok(ms) => Check { ok: true, ms, ..Default::default() },
@@ -71,18 +75,32 @@ pub async fn http(c: &reqwest::Client, url: &str) -> Check {
 /// Сервис открывается, если ответил хотя бы один из адресов.
 /// Для YouTube проверяем и страницу, и сам видеосервер: на части провайдеров
 /// сайт открывается, а видео не грузится.
-pub async fn any(c: &reqwest::Client, urls: &[&str]) -> Check {
+/// Адреса проверяются одновременно. Раньше они шли по очереди, и на нерабочей
+/// стратегии подбор ждал таймаут каждого адреса подряд, а потом ещё раз
+/// перепроверял YouTube, чтобы узнать причину. Теперь причина собирается сразу.
+pub async fn any(c: &reqwest::Client, urls: &[(&str, &str)]) -> Check {
+    let tasks: Vec<_> = urls
+        .iter()
+        .map(|(name, url)| {
+            let (c, name, url) = (c.clone(), name.to_string(), url.to_string());
+            tokio::spawn(async move { (name, fetch(&c, &url).await) })
+        })
+        .collect();
     let mut good = 0u8;
     let mut best = 0u64;
-    for u in urls {
-        let r = http(c, u).await;
-        if r.ok {
-            good += 1;
-            best = if best == 0 { r.ms } else { best.min(r.ms) };
+    let mut failed = Vec::new();
+    for t in tasks {
+        match t.await {
+            Ok((_, Ok(ms))) => {
+                good += 1;
+                best = if best == 0 { ms } else { best.min(ms) };
+            }
+            Ok((name, Err(e))) => failed.push(format!("{name} ({e})")),
+            Err(_) => failed.push("проверка прервалась".into()),
         }
     }
     let total = urls.len() as u8;
-    Check { ok: good > 0, ms: if good > 0 { best } else { 0 }, good, total }
+    Check { ok: good > 0, ms: if good > 0 { best } else { 0 }, good, total, failed }
 }
 
 pub async fn tcp(port: u16) -> Check {
@@ -234,28 +252,18 @@ pub async fn services(timeout: u64, dns: &Dns) -> Services {
 
 pub async fn discord_checks(c: &reqwest::Client) -> Check {
     any(c, &[
-        "https://discord.com/api/v9/experiments",
-        "https://gateway.discord.gg/?v=10&encoding=json",
+        ("api", "https://discord.com/api/v9/experiments"),
+        ("шлюз", "https://gateway.discord.gg/?v=10&encoding=json"),
     ])
     .await
 }
 
+/// Сайт, видеосервер и api YouTube. Что не открылось и почему, видно в `failed`:
+/// так понятно, что именно режет провайдер.
 pub async fn youtube_checks(c: &reqwest::Client) -> Check {
-    let owned = YOUTUBE.map(|(_, host, path)| format!("https://{host}{path}"));
-    let urls: Vec<&str> = owned.iter().map(String::as_str).collect();
+    let owned = YOUTUBE.map(|(name, host, path)| (name, format!("https://{host}{path}")));
+    let urls: Vec<(&str, &str)> = owned.iter().map(|(n, u)| (*n, u.as_str())).collect();
     any(c, &urls).await
-}
-
-/// Какие адреса YouTube не открылись и почему. Нужно для журнала: видно,
-/// что именно режет провайдер — сайт, видеосерверы или api.
-pub async fn youtube_failed(c: &reqwest::Client) -> Vec<String> {
-    let mut out = Vec::new();
-    for (name, host, path) in YOUTUBE {
-        if let Err(e) = fetch(c, &format!("https://{host}{path}")).await {
-            out.push(format!("{name} ({e})"));
-        }
-    }
-    out
 }
 
 /// Итог сравнения DNS Windows с безопасным DNS для www.youtube.com.
@@ -333,7 +341,7 @@ mod tests {
 
     #[test]
     fn counts_partial() {
-        let c = Check { ok: true, ms: 10, good: 2, total: 3 };
+        let c = Check { ok: true, ms: 10, good: 2, total: 3, ..Default::default() };
         assert!(c.ok && c.good < c.total);
     }
 
@@ -352,5 +360,19 @@ mod tests {
         assert_eq!(ips, vec!["142.250.74.14", "172.217.21.142"]);
         assert!(parse_doh(&serde_json::json!({ "Status": 3 })).is_empty());
         assert_eq!(show(&[]), "нет ответа");
+    }
+
+    #[test]
+    fn checks_in_parallel() {
+        // Два адреса, которые не отвечают: вместе они должны занять один таймаут, а не два.
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let t = Instant::now();
+        let r = rt.block_on(async {
+            let c = client(1);
+            any(&c, &[("a", "http://10.255.255.1/"), ("b", "http://10.255.255.2/")]).await
+        });
+        assert!(!r.ok);
+        assert_eq!(r.failed.len(), 2);
+        assert!(t.elapsed() < Duration::from_millis(1900), "проверки шли по очереди");
     }
 }

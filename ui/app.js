@@ -9,6 +9,7 @@ const mock = (() => {
     strategies:[['general.bat','Основная','Рекомендуемая, начните с неё'],['general (ALT).bat','ALT','Альтернативная разрезка пакетов'],['general (ALT2).bat','ALT2','Альтернативная разрезка пакетов'],['general (FAKE TLS AUTO).bat','FAKE TLS AUTO','Поддельное TLS-приветствие, часто помогает на мобильном интернете'],['general (SIMPLE FAKE).bat','SIMPLE FAKE','Простые фейковые пакеты']].map(([id,name,desc])=>({id,name,desc})),
     since:0, user_sites:['rutracker.org','nnmclub.to'], builtin_sites:142, auto_update:true, app_version:'0.5.0', zapret_version:'1.10.3', portable:false, versions:['zapret-discord-youtube 1.10.3 (winws из zapret v72.9)','tg-ws-proxy 1.11.1'] };
   const wait = ms => new Promise(r => setTimeout(r, ms));
+  let stopFlag = false;
   return async (cmd, a = {}) => {
     await wait(300);
     switch (cmd) {
@@ -23,8 +24,10 @@ const mock = (() => {
       case 'remove_site': st.user_sites = st.user_sites.filter(s => s !== a.domain); break;
       case 'check_services': await wait(900); return { discord:{ok:st.engine_on,ms:120,good:2,total:2}, youtube:{ok:st.engine_on,ms:140,good:3,total:3}, telegram:{ok:st.tg_on,ms:1,good:0,total:0}, chatgpt:st.ai, youtube_dns:false };
       case 'auto_pick':
-        for (const s of st.strategies) { emit('pick-progress',{id:s.id,state:'wait',ms:0}); await wait(400); emit('pick-progress',{id:s.id,state:s.id.includes('ALT2')?'bad':'ok',ms:100+Math.round(Math.random()*150)}); }
+        stopFlag = false;
+        for (const s of st.strategies) { if (stopFlag) break; emit('pick-progress',{id:s.id,state:'wait',ms:0}); await wait(400); emit('pick-progress',{id:s.id,state:s.id.includes('ALT2')?'bad':'ok',ms:100+Math.round(Math.random()*150)}); }
         st.strategy = 'general.bat'; st.engine_on = true; st.since = Date.now(); break;
+      case 'stop_pick': stopFlag = true; return null;
       case 'get_log': return '[prism] предпросмотр в браузере';
       case 'set_auto_update': st.auto_update = a.on; break;
       case 'check_updates': return { app:{current:'0.5.0',latest:'0.5.1',available:true}, zapret:{current:'1.10.3',latest:'1.10.3',available:false} };
@@ -49,7 +52,9 @@ let busy = null;       // обход включается или выключа�
 let checkGen = 0;      // поколение проверки: старые ответы после переключений не показываем
 const invalidate = () => { checkGen++; svc = null; };
 let picking = false;   // идёт подбор стратегии
+let stopping = false;  // нажали «Стоп», подбор заканчивает текущую проверку
 const pick = {};       // результаты подбора по id стратегии
+const PICK_WAIT = 'Дождитесь конца подбора или нажмите «Стоп»';
 
 const toast = t => { const el = $('#toast'); el.textContent = t; el.classList.add('show'); clearTimeout(toast.t); toast.t = setTimeout(() => el.classList.remove('show'), 2800); };
 const esc = s => String(s).replace(/[&<>"]/g, c => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;' }[c]));
@@ -123,9 +128,12 @@ const modText = {
   auto_update: on => on ? 'Автообновление включено' : 'Автообновление выключено',
 };
 const modVal = { tg: () => S.tg_on, games: () => S.games, ai: () => S.ai, autostart: () => S.autostart, tray: () => S.tray, auto_update: () => S.auto_update };
+// Эти переключатели перезапускают движок и сбили бы подбор.
+const engineMods = ['games'];
 $$('.sw[data-mod]').forEach(sw => sw.onclick = async () => {
   if (!S) return;
   const m = sw.dataset.mod, on = !modVal[m]();
+  if (picking && engineMods.includes(m)) { toast(PICK_WAIT); return; }
   sw.disabled = true; sw.setAttribute('aria-checked', on);
   if (m === 'tg' && svc) delete svc.telegram;
   try { await call(modCmd[m], { on }, modText[m](on)); } catch {}
@@ -171,17 +179,30 @@ function drawStrats() {
   });
 }
 listen('pick-progress', e => { pick[e.payload.id] = e.payload; render(); });
+// Кнопка «Подобрать» во время подбора становится «Стоп»: подбор допроверяет
+// текущую стратегию и включает лучшую из уже проверенных.
 $('#pickBtn').onclick = async () => {
-  if (picking || busy || !S) return;
-  picking = true;
+  if (picking) {
+    if (stopping) return;
+    stopping = true; render();
+    try { await invoke('stop_pick'); } catch {}
+    return;
+  }
+  if (busy || !S) return;
+  picking = true; stopping = false;
   for (const k in pick) delete pick[k];
   render();
   try {
     await call('auto_pick');
     const s = S.strategies.find(x => x.id === S.strategy);
-    toast(`Подобрана стратегия «${s ? s.name : S.strategy}». Обход включён`);
+    const name = s ? s.name : S.strategy;
+    toast(stopping
+      ? `Подбор остановлен. Стратегия «${name}»${S.engine_on ? ', обход включён' : ''}`
+      : `Подобрана стратегия «${name}». Обход включён`);
   } catch {}
-  picking = false; invalidate(); render(); checkSoon();
+  // Стратегия, на которой нажали «Стоп», не проверена: не показываем ей «Проверяю…».
+  for (const k in pick) if (pick[k].state === 'wait') delete pick[k];
+  picking = false; stopping = false; invalidate(); render(); checkSoon();
 };
 
 // Сайты
@@ -271,10 +292,11 @@ function render() {
   const partial = [['Discord', dc], ['YouTube', yt]].filter(([, x]) => x[0] === 'part').map(([n]) => n);
   const sub = $('#stateSub');
   const total = S.strategies.length, done = Object.values(pick).filter(r => r.state !== 'wait').length;
-  $('#state').textContent = busyText || (picking ? 'Подбираю стратегию' : on ? 'Обход включён' : 'Обход выключен');
+  $('#state').textContent = busyText || (picking ? (stopping ? 'Останавливаю подбор' : 'Подбираю стратегию') : on ? 'Обход включён' : 'Обход выключен');
   sub.className = 'state-sub' + ((failed.length || partial.length || dnsBad) && !busyText && !picking ? ' bad' : '');
   sub.textContent = busyText ? 'Это займёт пару секунд.'
-    : picking ? `Проверяю ${Math.min(done + 1, total)} из ${total}. Это займёт пару минут.`
+    : picking && stopping ? 'Допроверяю текущую стратегию и включу лучшую из проверенных.'
+    : picking ? `Проверяю ${Math.min(done + 1, total)} из ${total}. Это займёт минуту-другую.`
     : !on ? 'Нажмите, чтобы открылись Discord и YouTube.'
     : failed.length ? `${both(failed)} не ${failed.length > 1 ? 'открываются' : 'открывается'}. Нажмите «Подобрать», чтобы найти рабочую стратегию.`
     : dnsBad ? 'YouTube откроется только с безопасным DNS. Включите его в браузере: Настройки → Безопасность → «Использовать безопасный DNS».'
@@ -295,10 +317,11 @@ function render() {
     : picking ? (cur ? `Проверяю «${cur.name}»` : 'Готовлю проверку') : (strat ? strat.name : S.strategy);
   $('#arc').style.strokeDasharray = picking ? `${Math.max(2, Math.round(done / Math.max(total, 1) * 100))} 100` : '';
   const pb = $('#pickBtn');
-  pb.textContent = picking ? 'Подбираю…' : 'Подобрать';
+  pb.textContent = picking ? (stopping ? 'Останавливаю…' : 'Стоп') : 'Подобрать';
   pb.className = 'btn' + (failed.length && !picking ? ' primary' : '');
-  pb.disabled = picking || busy || !total;
+  pb.disabled = picking ? stopping : (busy || !total);
   $('#stratOpen').disabled = picking || !total;
+  $('#zapUpd').disabled = picking;
   if (dlg.open) drawStrats();
 
   // Модули
@@ -354,6 +377,7 @@ $('#appUpd').onclick = e => updateApp(e.currentTarget);
 $('#updBar').onclick = e => updateApp(e.currentTarget);
 $('#zapUpd').onclick = async e => {
   const b = e.currentTarget;
+  if (picking) { toast(PICK_WAIT); return; }
   if (!U || !U.zapret.available) return checkUpdates(false);
   b.disabled = true; b.textContent = 'Обновляю…';
   try { await call('update_zapret', {}, 'Обходы обновлены'); U.zapret.available = false; U.zapret.current = S.zapret_version; } catch {}
@@ -361,6 +385,8 @@ $('#zapUpd').onclick = async e => {
 };
 listen('updates', e => { U = e.payload; drawUpdates(); });
 listen('zapret-updated', e => toast(`Обходы обновлены до версии ${e.payload}`));
+// Сторож выключил обход: winws.exe падал несколько раз подряд.
+listen('engine-crashed', e => toast(String(e.payload)));
 
 listen('state-changed', () => refresh().then(checkSoon));
 refresh().then(checkSoon);
