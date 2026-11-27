@@ -10,8 +10,9 @@ mod updates;
 mod util;
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use tauri::menu::{Menu, MenuItem};
@@ -27,11 +28,19 @@ const ZAPRET_VERSION: &str = "обходы: Flowseal zapret-discord-youtube";
 const TG_VERSION: &str = "tg-ws-proxy 1.11.1";
 const TASK_NAME: &str = "Prism";
 
+/// Чем занят движок. Тексты уходят в окно, если команду пришлось отклонить.
+const PICKING: &str = "Идёт подбор стратегии";
+const UPDATING: &str = "Обновляются обходы";
+const RESTARTING: &str = "Обход перезапускается";
+/// Сторож перезапускает упавший winws.exe не чаще стольких раз за 5 минут.
+const MAX_RESTARTS: usize = 3;
+
 struct Inner {
     settings: Settings,
     engine: Engine,
     proxy: Proxy,
-    busy: bool,
+    /// Чем сейчас занят движок (см. Busy).
+    busy: Option<&'static str>,
 }
 
 struct Prism {
@@ -45,11 +54,39 @@ struct Prism {
     hosts_cache: PathBuf,
     /// Последний итог проверки DNS для YouTube: в журнал пишем, только когда он меняется.
     dns_note: Mutex<&'static str>,
+    /// Нажали «Стоп» во время подбора.
+    cancel: AtomicBool,
+}
+
+/// Движок занят: пока идёт подбор, обновление или перезапуск, другие команды
+/// движка отказываются. Раньше во время подбора можно было переключить игровой режим
+/// или обновить обходы, и движок перезапускался посреди проверки. Занятость
+/// снимается сама, когда Busy выходит из области видимости, даже при ошибке.
+struct Busy<'a>(&'a Prism);
+
+impl Drop for Busy<'_> {
+    fn drop(&mut self) {
+        self.0.inner.lock().unwrap().busy = None;
+    }
 }
 
 impl Prism {
     fn save(&self, i: &Inner) {
         i.settings.save(&self.settings_file);
+    }
+
+    /// Занять движок или сказать, чем он уже занят.
+    fn begin(&self, what: &'static str) -> R<Busy<'_>> {
+        let mut i = self.inner.lock().unwrap();
+        if let Some(cur) = i.busy {
+            return Err(if cur == PICKING {
+                format!("{cur}. Дождитесь конца или нажмите «Стоп»")
+            } else {
+                format!("{cur}, подождите пару секунд")
+            });
+        }
+        i.busy = Some(what);
+        Ok(Busy(self))
     }
 
     /// Записать в журнал итог проверки DNS. Проверка на главной идёт каждую минуту,
@@ -153,6 +190,7 @@ fn write_user_sites(z: &ZapretPaths, sites: &[String]) -> R<()> {
 }
 
 /// Запустить движок и убедиться, что он не упал сразу.
+/// Вызывается только тот, кто занял движок через Prism::begin.
 async fn start_engine(p: &Prism) -> R<()> {
     {
         let mut i = p.inner.lock().unwrap();
@@ -168,6 +206,12 @@ async fn start_engine(p: &Prism) -> R<()> {
     Ok(())
 }
 
+/// Остановить движок и выгрузить драйвер.
+fn stop_engine(p: &Prism) {
+    p.inner.lock().unwrap().engine.stop();
+    engine::kill_stray(&p.zapret);
+    engine::unload_driver(&p.zapret);
+}
 
 fn zapret_version(z: &ZapretPaths) -> String {
     std::fs::read_to_string(z.root.join("version.txt"))
@@ -220,6 +264,8 @@ async fn do_update_zapret(p: &Prism) -> R<bool> {
     let asset = updates::zapret_asset(&rel).ok_or("В релизе Flowseal нет архива zapret")?.clone();
     p.log.push(format!("[prism] скачиваю обходы Flowseal {}", rel.tag_name));
     let bytes = updates::download_verified(&asset).await?;
+    // Пока файл качается, движок свободен. Занимаем его только на замену файлов.
+    let _busy = p.begin(UPDATING)?;
     let root = p.zapret.root.clone();
     let fresh = root.with_file_name("zapret-new");
     let old = root.with_file_name("zapret-old");
@@ -319,12 +365,11 @@ async fn get_state(p: State<'_, Prism>) -> R<AppState> {
 
 #[tauri::command]
 async fn set_engine(p: State<'_, Prism>, on: bool) -> R<AppState> {
+    let _busy = p.begin(RESTARTING)?;
     if on {
         start_engine(&p).await?;
     } else {
-        p.inner.lock().unwrap().engine.stop();
-        engine::kill_stray(&p.zapret);
-        engine::unload_driver(&p.zapret);
+        stop_engine(&p);
     }
     {
         let mut i = p.inner.lock().unwrap();
@@ -339,6 +384,7 @@ async fn set_strategy(p: State<'_, Prism>, id: String) -> R<AppState> {
     if !engine::list_strategies(&p.zapret).iter().any(|s| s.id == id) {
         return Err("Такой стратегии нет".into());
     }
+    let _busy = p.begin(RESTARTING)?;
     let running = {
         let mut i = p.inner.lock().unwrap();
         i.settings.strategy = id;
@@ -353,6 +399,7 @@ async fn set_strategy(p: State<'_, Prism>, id: String) -> R<AppState> {
 
 #[tauri::command]
 async fn set_games(p: State<'_, Prism>, on: bool) -> R<AppState> {
+    let _busy = p.begin(RESTARTING)?;
     let running = {
         let mut i = p.inner.lock().unwrap();
         i.settings.games = on;
@@ -510,15 +557,14 @@ struct Progress {
 
 #[tauri::command]
 async fn auto_pick(app: AppHandle, p: State<'_, Prism>) -> R<AppState> {
-    {
-        let mut i = p.inner.lock().unwrap();
-        if i.busy {
-            return Err("Подбор уже идёт".into());
-        }
-        i.busy = true;
-    }
+    let _busy = p.begin(PICKING)?;
+    p.cancel.store(false, Ordering::SeqCst);
+    let stopped = || p.cancel.load(Ordering::SeqCst);
     let list = engine::list_strategies(&p.zapret);
-    let previous = p.inner.lock().unwrap().settings.strategy.clone();
+    let (previous, was_on) = {
+        let i = p.inner.lock().unwrap();
+        (i.settings.strategy.clone(), i.settings.engine_on)
+    };
     // YouTube проверяем по адресам от безопасного DNS: так стратегии сравниваются
     // по тому, как они обходят блокировку, а не по ответу DNS провайдера.
     let dns = probe::Dns::lookup().await;
@@ -529,16 +575,22 @@ async fn auto_pick(app: AppHandle, p: State<'_, Prism>) -> R<AppState> {
     });
     let mut best: Option<(usize, u64, String)> = None;
     for s in &list {
+        if stopped() {
+            break;
+        }
         let _ = app.emit("pick-progress", Progress { id: s.id.clone(), state: "wait", ms: 0 });
         p.inner.lock().unwrap().settings.strategy = s.id.clone();
         let started = start_engine(&p).await.is_ok();
+        if stopped() {
+            break;
+        }
         // Оценка важнее «работает/не работает»: для YouTube считаем, сколько адресов
         // ответило из проверенных. Стратегия, где открывается сайт, но не видео, хуже.
         let (score, ms, failed_yt) = if started {
             let mut r = probe::services(4, &dns).await;
             // Сразу после перезапуска движка часть соединений ещё не поднялась.
             // Нулевой результат повторяем один раз, чтобы не отбросить рабочую стратегию.
-            if !r.discord.ok && !r.youtube.ok {
+            if !r.discord.ok && !r.youtube.ok && !stopped() {
                 tokio::time::sleep(Duration::from_millis(900)).await;
                 r = probe::services(4, &dns).await;
             }
@@ -547,12 +599,8 @@ async fn auto_pick(app: AppHandle, p: State<'_, Prism>) -> R<AppState> {
             let adr = svc.iter().map(|x| x.good as usize).sum::<usize>();
             let ms = if ok > 0 { (r.discord.ms + r.youtube.ms) / ok as u64 } else { 0 };
             // Что именно не открылось и почему: сайт, видеосервер или api.
-            let failed = if r.youtube.total > r.youtube.good {
-                probe::youtube_failed(&dns.client(4)).await
-            } else {
-                Vec::new()
-            };
-            (ok * 100 + adr, ms, failed.join(", "))
+            // Причины собраны в той же проверке, перепроверять YouTube не нужно.
+            (ok * 100 + adr, ms, r.youtube.failed.join(", "))
         } else {
             (0, 0, String::new())
         };
@@ -571,19 +619,40 @@ async fn auto_pick(app: AppHandle, p: State<'_, Prism>) -> R<AppState> {
             best = Some((score, ms, s.id.clone()));
         }
     }
-    let chosen = best.map(|b| b.2).unwrap_or(previous);
+    // «Стоп» берёт лучшую из уже проверенных. Если рабочей не нашлось,
+    // возвращаем прежнюю стратегию и прежнее состояние обхода.
+    let cancelled = stopped();
+    let (chosen, on) = match best {
+        Some(b) => (b.2, true),
+        None if cancelled => (previous, was_on),
+        None => (previous, true),
+    };
+    if cancelled {
+        p.log.push("[prism] подбор остановлен");
+    }
     {
         let mut i = p.inner.lock().unwrap();
         i.settings.strategy = chosen;
-        i.settings.engine_on = true;
-        i.busy = false;
+        i.settings.engine_on = on;
         p.save(&i);
     }
-    let result = start_engine(&p).await;
-    result?;
-    // Итог для журнала: открывается ли YouTube по адресу от DNS Windows.
-    p.note_dns(&probe::youtube_dns(&dns, 5).await, true);
+    if on {
+        start_engine(&p).await?;
+        if !cancelled {
+            // Итог для журнала: открывается ли YouTube по адресу от DNS Windows.
+            p.note_dns(&probe::youtube_dns(&dns, 5).await, true);
+        }
+    } else {
+        stop_engine(&p);
+    }
     Ok(snapshot(&p))
+}
+
+/// «Стоп» во время подбора: текущая проверка доходит до конца, дальше подбор не идёт.
+#[tauri::command]
+async fn stop_pick(p: State<'_, Prism>) -> R<()> {
+    p.cancel.store(true, Ordering::SeqCst);
+    Ok(())
 }
 
 fn xml_escape(s: &str) -> String {
@@ -745,6 +814,52 @@ fn shutdown(app: &AppHandle) {
     }
 }
 
+/// Сторож движка. Если winws.exe упал, пока Prism свёрнут в трей, обход раньше молча
+/// пропадал до следующего запуска. Теперь он перезапускается, но не чаще
+/// MAX_RESTARTS раз за 5 минут: если стратегия падает стабильно, обход выключается
+/// и окно говорит об этом, чтобы не крутиться в цикле.
+async fn watchdog(app: AppHandle) {
+    let p = app.state::<Prism>();
+    let mut restarts: Vec<Instant> = Vec::new();
+    loop {
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        let code = {
+            let mut i = p.inner.lock().unwrap();
+            if i.busy.is_some() || !i.settings.engine_on {
+                None
+            } else {
+                i.engine.exited()
+            }
+        };
+        let Some(code) = code else { continue };
+        let Ok(busy) = p.begin(RESTARTING) else { continue };
+        restarts.retain(|t| t.elapsed() < Duration::from_secs(300));
+        if restarts.len() >= MAX_RESTARTS {
+            stop_engine(&p);
+            {
+                let mut i = p.inner.lock().unwrap();
+                i.settings.engine_on = false;
+                p.save(&i);
+            }
+            restarts.clear();
+            drop(busy);
+            let text = "Обход выключен: winws.exe падает снова и снова. Нажмите «Подобрать» или выберите другую стратегию";
+            p.log.push(format!("[prism] winws.exe завершился ({code}) {MAX_RESTARTS} раза за 5 минут. {text}"));
+            let _ = app.emit("engine-crashed", text);
+            let _ = app.emit("state-changed", ());
+            continue;
+        }
+        restarts.push(Instant::now());
+        p.log.push(format!("[prism] winws.exe неожиданно завершился ({code}), перезапускаю"));
+        match start_engine(&p).await {
+            Ok(()) => p.log.push("[prism] обход снова работает"),
+            Err(e) => p.log.push(format!("[prism] {e}")),
+        }
+        drop(busy);
+        let _ = app.emit("state-changed", ());
+    }
+}
+
 /// Сообщить о том, из-за чего Prism не может работать, и закрыться.
 /// Без этого программа молча исчезала: окна ещё нет, а ошибка уходила в никуда.
 fn fatal(text: &str) -> ! {
@@ -825,7 +940,7 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     let keep_task = settings.autostart;
 
     app.manage(Prism {
-        inner: Mutex::new(Inner { settings, engine: Engine::default(), proxy: Proxy::default(), busy: false }),
+        inner: Mutex::new(Inner { settings, engine: Engine::default(), proxy: Proxy::default(), busy: None }),
         log,
         zapret,
         tg_exe: res.join("tgproxy").join("tg-ws-proxy.exe"),
@@ -833,6 +948,7 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         hosts_cache: data.join("ai-hosts.txt"),
         data,
         dns_note: Mutex::new(""),
+        cancel: AtomicBool::new(false),
     });
 
     // Трей
@@ -881,13 +997,17 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
+    tauri::async_runtime::spawn(watchdog(app.handle().clone()));
+
     // Вернуть то, что было включено в прошлый раз.
     let handle = app.handle().clone();
     tauri::async_runtime::spawn(async move {
         let p = handle.state::<Prism>();
         if restore.0 {
-            if let Err(e) = start_engine(&p).await {
-                p.log.push(format!("[prism] {e}"));
+            if let Ok(_busy) = p.begin(RESTARTING) {
+                if let Err(e) = start_engine(&p).await {
+                    p.log.push(format!("[prism] {e}"));
+                }
             }
         }
         if restore.1 {
@@ -899,7 +1019,7 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         }
         let _ = handle.emit("state-changed", ());
 
-        // Обновить задание автозапуска: путь к программе мог измениться,
+        // Обновить задание автозапуска: путь к программ�� мог измениться,
         // а задания из старых версий не запускались от батареи.
         // Портативным копиям старые версии тоже ставили задание, такое задание убираем.
         if keep_task {
@@ -964,7 +1084,7 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             get_state, set_engine, set_strategy, set_games, set_ai, set_tg, open_tg_link,
-            add_site, remove_site, check_services, auto_pick, set_autostart, set_tray, get_log, close_window,
+            add_site, remove_site, check_services, auto_pick, stop_pick, set_autostart, set_tray, get_log, close_window,
             check_updates, update_zapret, update_app, set_auto_update
         ])
         .build(tauri::generate_context!())
