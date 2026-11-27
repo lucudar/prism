@@ -59,16 +59,27 @@ function setText(el, v, anim, dy = 4) {
   if ((el._next ?? el.textContent) === v) return;
   if (anim && el.animate && !still()) { swap(el, v, dy); return; }
   if (el._swap) { el._swap.cancel(); el._swap = null; }
+  if (el._in) { el._in.cancel(); el._in = null; }
   el._next = undefined;
   el.textContent = v;
 }
 // Текст сменяется в два шага: старый тает, потом проявляется новый. Если за это
 // время текст поменялся ещё раз, покажется последний, без лишнего мигания.
-// Уход начинается с того места, где сейчас прошлая анимация, а не с полной яркости.
+// Если новый текст ещё проявлялся, уход начинается с его текущей яркости и места:
+// проявление останавливается, и текст не вспыхивает перед тем, как погаснуть.
 function swap(el, v, dy) {
   el._next = v;
   if (el._swap) return;
-  const out = el.animate([dy ? { opacity: 0, transform: `translateY(${-dy / 2}px)` } : { opacity: 0 }],
+  const from = { opacity: 1 };
+  if (dy) from.transform = 'none';
+  if (el._in) {
+    const cs = getComputedStyle(el);
+    from.opacity = +cs.opacity;
+    if (dy) from.transform = cs.transform;
+    el._in.cancel();
+    el._in = null;
+  }
+  const out = el.animate([from, dy ? { opacity: 0, transform: `translateY(${-dy / 2}px)` } : { opacity: 0 }],
     { duration: 140, easing: EASE_IN, fill: 'forwards' });
   el._swap = out;
   out.onfinish = () => {
@@ -76,8 +87,10 @@ function swap(el, v, dy) {
     el._swap = null;
     el.textContent = el._next;
     el._next = undefined;
-    el.animate(dy ? [{ opacity: 0, transform: `translateY(${dy}px)` }, { opacity: 1, transform: 'none' }] : [{ opacity: 0 }, { opacity: 1 }],
+    const inn = el.animate(dy ? [{ opacity: 0, transform: `translateY(${dy}px)` }, { opacity: 1, transform: 'none' }] : [{ opacity: 0 }, { opacity: 1 }],
       { duration: 340, easing: EASE });
+    el._in = inn;
+    inn.onfinish = () => { if (el._in === inn) el._in = null; };
     out.cancel();
   };
 }
@@ -138,7 +151,8 @@ $('#wClose').onclick = () => invoke('close_window');
 
 // Разделы: подложка выбранной вкладки переезжает пружиной. Страницы слева от
 // текущей ждут слева, справа справа: новая приезжает со стороны своей вкладки,
-// старая уезжает в другую сторону.
+// старая уезжает в другую сторону. Неактивные страницы инертны: пока старая
+// ещё тает, Tab по её кнопкам уже не ходит.
 const tabs = $$('.seg button'), inkEl = $('.seg-ink');
 let page = 'home';
 function ink(instant) {
@@ -149,18 +163,22 @@ function ink(instant) {
   inkEl.style.setProperty('--w', cur.offsetWidth + 'px');
   if (instant) { inkEl.getBoundingClientRect(); inkEl.style.transition = ''; }
 }
+function place(to) {
+  tabs.forEach((b, i) => {
+    const p = $('#p-' + b.dataset.go);
+    if (!p) return;
+    p.style.setProperty('--off', Math.sign(i - to));
+    p.classList.toggle('on', i === to);
+    p.inert = i !== to;
+  });
+}
 function go(next) {
   if (next === page) return;
   const to = tabs.findIndex(b => b.dataset.go === next);
   if (to < 0) return;
   page = next;
-  tabs.forEach((b, i) => {
-    i === to ? b.setAttribute('aria-current', 'page') : b.removeAttribute('aria-current');
-    const p = $('#p-' + b.dataset.go);
-    if (!p) return;
-    p.style.setProperty('--off', Math.sign(i - to));
-    p.classList.toggle('on', i === to);
-  });
+  tabs.forEach((b, i) => i === to ? b.setAttribute('aria-current', 'page') : b.removeAttribute('aria-current'));
+  place(to);
   ink();
   edge();
   if (next === 'set') loadLog();
@@ -172,6 +190,7 @@ function edge() {
 }
 $$('.page').forEach(p => p.addEventListener('scroll', () => { if (p.classList.contains('on')) edge(); }, { passive: true }));
 tabs.forEach(b => b.onclick = () => go(b.dataset.go));
+place(tabs.findIndex(b => b.dataset.go === page));
 addEventListener('resize', () => ink(true));
 document.fonts && document.fonts.ready.then(() => ink(true));
 ink(true);
