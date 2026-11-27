@@ -1183,7 +1183,7 @@ fn fatal(text: &str) -> ! {
     std::process::exit(1)
 }
 
-/// Свои списки сайтов и подсетей, которые переносятся из прошлых версий.
+/// Свои списки сайтов и подсетей, которые пере��осятся из прошлых версий.
 const USER_LISTS: [&str; 3] = ["list-general-user.txt", "list-exclude-user.txt", "ipset-exclude-user.txt"];
 
 /// Строка списка zapret: домен, IP или подсеть. Остальное при переносе отбрасывается.
@@ -1346,10 +1346,14 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         let p = handle.state::<Prism>();
         if restore.0 {
             // Ждём движок, а не пропускаем запуск: профиль сети мог занять его первым
-            // и только выбрать стратегию, ведь обход ещё не работал.
+            // и только выбрать стратегию, ведь обход ещё не работал. Флажок читаем
+            // заново: пока ждали, обход могли выключить вручную, и включать его нельзя.
             let _busy = p.wait_begin(RESTARTING).await;
-            let running = p.inner.lock().unwrap().engine.alive();
-            if !running {
+            let (wanted, running) = {
+                let mut i = p.inner.lock().unwrap();
+                (i.settings.engine_on, i.engine.alive())
+            };
+            if wanted && !running {
                 if let Err(e) = start_engine(&p).await {
                     p.log.push(format!("[prism] {e}"));
                 }
