@@ -21,7 +21,7 @@ const mock = (() => {
       case 'set_tray': st.tray = a.on; break;
       case 'add_site': st.user_sites.unshift(a.domain); break;
       case 'remove_site': st.user_sites = st.user_sites.filter(s => s !== a.domain); break;
-      case 'check_services': await wait(900); return { discord:{ok:st.engine_on,ms:120,good:2,total:2}, youtube:{ok:st.engine_on,ms:140,good:3,total:3}, telegram:{ok:st.tg_on,ms:1,good:0,total:0}, chatgpt:st.ai };
+      case 'check_services': await wait(900); return { discord:{ok:st.engine_on,ms:120,good:2,total:2}, youtube:{ok:st.engine_on,ms:140,good:3,total:3}, telegram:{ok:st.tg_on,ms:1,good:0,total:0}, chatgpt:st.ai, youtube_dns:false };
       case 'auto_pick':
         for (const s of st.strategies) { emit('pick-progress',{id:s.id,state:'wait',ms:0}); await wait(400); emit('pick-progress',{id:s.id,state:s.id.includes('ALT2')?'bad':'ok',ms:100+Math.round(Math.random()*150)}); }
         st.strategy = 'general.bat'; st.engine_on = true; st.since = Date.now(); break;
@@ -261,17 +261,23 @@ function render() {
   pw.disabled = busy || picking;
 
   // Состояние и подсказка
-  const dc = web('discord'), yt = web('youtube');
+  const dc = web('discord');
+  let yt = web('youtube');
+  // YouTube открывается только по адресу от безопасного DNS: обход работает,
+  // но браузер с DNS провайдера пишет «Нет подключения к интернету».
+  const dnsBad = on && !busyText && !picking && !!(svc && svc.youtube_dns);
+  if (dnsBad && yt[0] === 'ok') yt = ['part', 'Нужен безопасный DNS', yt[2]];
   const failed = [['Discord', dc], ['YouTube', yt]].filter(([, x]) => x[0] === 'fail').map(([n]) => n);
   const partial = [['Discord', dc], ['YouTube', yt]].filter(([, x]) => x[0] === 'part').map(([n]) => n);
   const sub = $('#stateSub');
   const total = S.strategies.length, done = Object.values(pick).filter(r => r.state !== 'wait').length;
   $('#state').textContent = busyText || (picking ? 'Подбираю стратегию' : on ? 'Обход включён' : 'Обход выключен');
-  sub.className = 'state-sub' + ((failed.length || partial.length) && !busyText && !picking ? ' bad' : '');
+  sub.className = 'state-sub' + ((failed.length || partial.length || dnsBad) && !busyText && !picking ? ' bad' : '');
   sub.textContent = busyText ? 'Это займёт пару секунд.'
     : picking ? `Проверяю ${Math.min(done + 1, total)} из ${total}. Это займёт пару минут.`
     : !on ? 'Нажмите, чтобы открылись Discord и YouTube.'
     : failed.length ? `${both(failed)} не ${failed.length > 1 ? 'открываются' : 'открывается'}. Нажмите «Подобрать», чтобы найти рабочую стратегию.`
+    : dnsBad ? 'YouTube откроется только с безопасным DNS. Включите его в браузере: Настройки → Безопасность → «Использовать безопасный DNS».'
     : partial.length ? `${both(partial)}: открывается не всё. Нажмите «Подобрать», чтобы проверить другие стратегии.`
     : dc[0] === 'wait' || yt[0] === 'wait' ? 'Проверяю Discord и YouTube…'
     : 'Discord и YouTube открываются.';
@@ -303,8 +309,8 @@ function render() {
   $('#tgMore').hidden = !S.tg_on || tgBad;
   if (!S.tg_on) $('#tgKv').hidden = true;
   $('#tgHost').textContent = S.tg.host; $('#tgPort').textContent = S.tg.port; $('#tgSecret').textContent = 'dd' + S.tg.secret;
-  $('#gmSub').textContent = !S.games ? 'Онлайн-игры и Discord. Вход в игры не ломает'
-    : on ? 'Работает. Лаунчеры и античиты не трогает' : 'Включится вместе с обходом';
+  $('#gmSub').textContent = !S.games ? 'Включайте, если игра тормозит или не заходит'
+    : on ? 'Работает. Если игра не заходит, выключите' : 'Включится вместе с обходом';
   $('#tgItem').classList.toggle('is-on', S.tg_on && !tgBad);
   $('#gmItem').classList.toggle('is-on', S.games);
   $('#aiItem').classList.toggle('is-on', S.ai);
