@@ -6,72 +6,91 @@
 <title>Prism</title>
 <link rel="stylesheet" href="fonts.css">
 <style>
-/* Prism 0.6: строгая чёрно-белая палитра без цвета. Премиальность дают
-   глубина, аккуратная сетка, крупная типографика и мягкие тени, а не градиенты
-   в цвете. Иерархию задают размер шрифта, яркость текста и тонкие линии. */
+/* Prism 0.14: строгая чёрно-белая палитра без цвета. Глубину дают свет и материал:
+   функциональный слой (шапка над прокруткой, окно выбора, уведомления) из тёмного
+   стекла, контент плотный и спокойный. Двигаются только transform и opacity, поэтому
+   анимации не пересчитывают раскладку и не грузят процессор, а в покое не идёт ни одна. */
 :root{
-  --bg:#070708; --surface:#0D0D0F; --surface2:#131316;
-  --fg:#fff; --fg2:#9A9AA2; --fg3:#5E5E66;
-  --line:#1C1C21; --edge:#2A2A31; --edge-hi:#45454F;
-  --hover:rgba(255,255,255,.045);
-  --lift:inset 0 1px 0 rgba(255,255,255,.055);
-  --shadow:0 24px 60px -30px rgba(0,0,0,.95),0 2px 0 rgba(0,0,0,.6);
-  --r:14px;
-  --mono:"Cascadia Mono",Consolas,ui-monospace,monospace;
   color-scheme:dark;
+  /* Поверхности снизу вверх */
+  --bg:oklch(.129 .003 286);
+  --surface:oklch(.16 .004 286);
+  --surface-2:oklch(.188 .006 286);
+  --surface-3:oklch(.215 .007 286);
+  /* Текст: основной, вторичный, третичный (не ниже 4,5:1 на фоне) */
+  --fg:oklch(1 0 0);
+  --fg-2:oklch(.72 .011 286);
+  --fg-3:oklch(.6 .012 286);
+  --on-fg:var(--bg);
+  /* Линии и подсветка */
+  --line:oklch(.229 .01 286);
+  --edge:oklch(.288 .013 286);
+  --edge-hi:oklch(.394 .017 286);
+  --hover:color-mix(in oklch,var(--fg) 5%,transparent);
+  --lift:inset 0 1px 0 color-mix(in oklch,var(--fg) 6%,transparent);
+  /* Стекло: тон, кромка, блик и тень парящего слоя */
+  --glass:color-mix(in oklch,var(--surface) 66%,transparent);
+  --glass-edge:color-mix(in oklch,var(--fg) 11%,transparent);
+  --glass-hi:inset 0 1px 0 color-mix(in oklch,var(--fg) 14%,transparent);
+  --glass-shadow:0 18px 44px -18px oklch(0 0 0 / .85);
+  --blur:blur(24px) saturate(160%);
+  /* Скругления: карточка и лист, контролы капсулой */
+  --r-card:16px;
+  --r-sheet:22px;
+  /* Движение: отклик, мягкая пружина почти без отскока, длительности */
+  --ease:cubic-bezier(.2,.8,.2,1);
+  --spring:cubic-bezier(.32,1.2,.52,1);
+  --fast:.14s;
+  --mid:.22s;
+  --slow:.38s;
+  --mono:"Cascadia Mono",Consolas,ui-monospace,monospace;
 }
 *{box-sizing:border-box}
 html,body{height:100%;margin:0}
-body{font:400 14.5px/1.5 Onest,"Segoe UI",sans-serif;color:var(--fg);background:var(--bg);overflow:hidden;user-select:none;-webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale;font-variant-numeric:tabular-nums;letter-spacing:-.005em}
-body::before{content:"";position:fixed;inset:-20% -20% auto;height:70%;pointer-events:none;background:radial-gradient(60% 100% at 50% 0,rgba(255,255,255,.055),transparent 70%);z-index:0}
-/* Windows 11: эффект Mica. Фон окна полупрозрачный, сквозь него едва видны обои.
-   Тёмная подложка остаётся плотной, поэтому текст такой же контрастный. В Windows 10
-   класса mica нет, и окно целиком непрозрачное. */
-body.mica{background:rgba(7,7,8,.72)}
-body.mica .top{background:rgba(7,7,8,.5)}
-body.mica .group{background:linear-gradient(180deg,rgba(13,13,15,.82),rgba(13,13,15,.5))}
-body.mica .panel{background:rgba(13,13,15,.8)}
+body{font:400 14.5px/1.5 Onest,"Segoe UI",sans-serif;color:var(--fg);background:var(--bg);overflow:hidden;user-select:none;cursor:default;-webkit-font-smoothing:antialiased;font-variant-numeric:tabular-nums;letter-spacing:-.005em}
+/* Мягкий свет сверху, будто от шапки окна */
+body::before{content:"";position:fixed;inset:-20% -20% auto;height:70%;pointer-events:none;background:radial-gradient(60% 100% at 50% 0,color-mix(in oklch,var(--fg) 5%,transparent),transparent 70%);z-index:0}
+/* Windows 11: эффект Mica. Сквозь окно едва видны обои, но подложка остаётся
+   плотной, и текст такой же контрастный. В Windows 10 класса mica нет. */
+body.mica{background:color-mix(in oklch,var(--bg) 72%,transparent)}
+body.mica .group,body.mica .panel{background:color-mix(in oklch,var(--surface) 84%,transparent)}
+/* Окно появляется, когда пришло состояние, а не с заглушками, которые тут же меняются */
+main,.seg{transition:opacity .3s var(--ease)}
+body:not(.ready) main,body:not(.ready) .seg{opacity:0}
 button{font:inherit;color:inherit}
-:focus-visible{outline:1px solid var(--fg);outline-offset:3px;border-radius:6px}
+:focus-visible{outline:2px solid var(--fg);outline-offset:2px}
 [hidden]{display:none!important}
 svg{display:block}
 
-/* Заголовок окна */
-.top{position:fixed;top:0;left:0;right:0;height:52px;display:flex;align-items:center;padding-left:22px;border-bottom:1px solid var(--line);background:rgba(7,7,8,.72);backdrop-filter:blur(18px) saturate(120%);z-index:5}
-.brand{display:flex;align-items:center;gap:10px;margin-right:30px;font-size:14.5px;font-weight:600;letter-spacing:-.015em}
+/* Заголовок окна. Стекло появляется, только когда под шапку уезжает контент */
+.top{position:fixed;top:0;left:0;right:0;height:52px;display:flex;align-items:center;padding-left:18px;z-index:5}
+.top::before{content:"";position:absolute;inset:0;z-index:-1;background:var(--glass);-webkit-backdrop-filter:var(--blur);backdrop-filter:var(--blur);box-shadow:inset 0 -1px 0 var(--glass-edge);opacity:0;transition:opacity var(--mid) var(--ease);pointer-events:none}
+body.scrolled .top::before{opacity:1}
+.brand{display:flex;align-items:center;gap:10px;margin-right:22px;font-size:14.5px;font-weight:600;letter-spacing:-.015em}
 .brand svg{width:15px;height:14px}
-.seg{display:flex;gap:26px;height:100%;position:relative}
-.seg button{position:relative;height:100%;padding:0;border:0;background:none;font-size:13px;letter-spacing:0;color:var(--fg2);cursor:pointer;transition:color .15s}
-.seg button:hover{color:var(--fg)}
-.seg button[aria-current=page]{color:var(--fg)}
-.seg button[aria-current=page]::after{display:none}
-.seg-ink{position:absolute;left:0;bottom:-1px;height:1.5px;width:0;border-radius:2px;background:var(--fg);transform:translateX(var(--x,0));transition:transform .42s cubic-bezier(.22,1,.36,1),width .42s cubic-bezier(.22,1,.36,1);pointer-events:none}
-.seg button{transition:color .25s ease,opacity .25s ease}
+/* Разделы: капсула, подложка выбранной вкладки переезжает пружиной */
+.seg{position:relative;display:flex;gap:2px;padding:3px;border-radius:999px;background:color-mix(in oklch,var(--fg) 5%,transparent);box-shadow:inset 0 0 0 1px color-mix(in oklch,var(--fg) 6%,transparent)}
+.seg button{position:relative;z-index:1;height:28px;padding:0 14px;border:0;border-radius:999px;background:none;color:var(--fg-2);font-size:13px;font-weight:500;cursor:pointer;transition:color var(--mid) var(--ease),transform var(--mid) var(--spring)}
+.seg button:hover,.seg button[aria-current=page]{color:var(--fg)}
+.seg button:active{transform:scale(.95)}
+.seg-ink{position:absolute;top:3px;left:0;height:28px;width:var(--w,0);border-radius:999px;background:color-mix(in oklch,var(--fg) 12%,transparent);box-shadow:inset 0 1px 0 color-mix(in oklch,var(--fg) 14%,transparent),0 6px 14px -8px oklch(0 0 0 / .9);transform:translateX(var(--x,0));transition:transform var(--slow) var(--spring),width var(--slow) var(--spring);pointer-events:none}
 .grow{flex:1;align-self:stretch}
-.pill{flex:none;display:flex;align-items:center;gap:8px;height:28px;margin-right:10px;padding:0 13px 0 10px;border:0;border-radius:14px;background:var(--fg);color:var(--bg);font-size:12.5px;font-weight:600;letter-spacing:0;cursor:pointer;box-shadow:0 8px 24px -12px rgba(255,255,255,.5);transition:transform .15s,box-shadow .15s}
-.pill:hover{transform:translateY(-1px);box-shadow:0 12px 28px -12px rgba(255,255,255,.6)}
+.pill{flex:none;display:flex;align-items:center;gap:8px;height:28px;margin-right:10px;padding:0 13px 0 10px;border:0;border-radius:999px;background:var(--fg);color:var(--on-fg);font-size:12.5px;font-weight:600;cursor:pointer;box-shadow:0 8px 24px -12px color-mix(in oklch,var(--fg) 50%,transparent);transition:transform var(--mid) var(--spring),opacity var(--mid) var(--ease),display var(--mid) allow-discrete}
+.pill[hidden]{opacity:0;transform:scale(.9)}
+@starting-style{.pill{opacity:0;transform:scale(.9)}}
+.pill:active{transform:scale(.96)}
 .pill svg{width:12px;height:12px}
-.pill:disabled{opacity:.55;cursor:default;transform:none;box-shadow:none}
-.wbtn{flex:none;width:48px;height:51px;display:grid;place-items:center;border:0;background:none;color:var(--fg2);cursor:pointer;transition:color .15s,background .15s}
+.pill:disabled{opacity:.55;cursor:default}
+.wbtn{flex:none;width:46px;height:52px;display:grid;place-items:center;border:0;background:none;color:var(--fg-2);cursor:pointer;transition:color var(--fast),background-color var(--fast)}
 .wbtn svg{width:11px;height:11px}
 .wbtn:hover{color:var(--fg);background:var(--hover)}
-.wbtn.close:hover{background:var(--fg);color:var(--bg)}
+.wbtn.close:hover{background:var(--fg);color:var(--on-fg)}
 
-/* Страницы */
-.page{position:fixed;top:52px;left:0;right:0;bottom:0;overflow:auto;overscroll-behavior:contain;scrollbar-gutter:stable;padding:34px 38px 36px;display:none;z-index:1}
-.page.on{display:block;animation:pagein .34s cubic-bezier(.2,.8,.2,1) both}
-@keyframes pagein{from{opacity:0;transform:translateY(9px)}}
-/* Карточки появляются друг за другом, а не все сразу */
-.page.on .list > *,.page.on .col > *{animation:rise .45s cubic-bezier(.2,.8,.2,1) both}
-.page.on .list > *:nth-child(1),.page.on .col > *:nth-child(1){animation-delay:.02s}
-.page.on .list > *:nth-child(2),.page.on .col > *:nth-child(2){animation-delay:.07s}
-.page.on .list > *:nth-child(3),.page.on .col > *:nth-child(3){animation-delay:.12s}
-.page.on .list > *:nth-child(4),.page.on .col > *:nth-child(4){animation-delay:.17s}
-.page.on .list > *:nth-child(5),.page.on .col > *:nth-child(5){animation-delay:.22s}
-.page.on .list > *:nth-child(n+6),.page.on .col > *:nth-child(n+6){animation-delay:.26s}
-@keyframes rise{from{opacity:0;transform:translateY(10px)}}
-@keyframes sheen{0%{left:-40%;opacity:0}20%{opacity:1}100%{left:110%;opacity:0}}
-@keyframes fade{from{opacity:0}}
+/* Страницы уходят под шапку: при прокрутке она становится стеклом. Новая страница
+   въезжает с той стороны, где стоит её вкладка, за 0,22 с, без каскада карточек */
+.page{position:fixed;inset:0;overflow:auto;overscroll-behavior:contain;scrollbar-gutter:stable;padding:86px 38px 36px;display:none;z-index:1}
+.page.on{display:block;animation:pagein var(--mid) var(--ease) backwards}
+@keyframes pagein{from{opacity:0;transform:translateX(calc(var(--dir,0) * 14px))}}
 .col{max-width:580px;margin:0 auto}
 
 /* Главная: слева кнопка, справа список */
@@ -79,170 +98,187 @@ svg{display:block}
 .hero{display:flex;flex-direction:column;min-height:100%}
 .hero-main{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;padding:8px 0 26px}
 .dial{position:relative;width:216px;height:216px;margin-bottom:30px;display:grid;place-items:center;isolation:isolate}
-/* Мягкое свечение под кнопкой: включается вместе с обходом */
-.dial::before{content:"";position:absolute;inset:-14%;border-radius:50%;background:radial-gradient(circle,rgba(255,255,255,.16),rgba(255,255,255,.04) 42%,transparent 68%);opacity:0;filter:blur(14px);transform:scale(.9);transition:opacity .6s ease,transform .8s cubic-bezier(.2,.8,.2,1);z-index:-1;pointer-events:none}
-body.on .dial::before{opacity:1;transform:scale(1)}
-/* Тонкое внешнее кольцо-шкала */
-.dial::after{content:"";position:absolute;inset:-8px;border-radius:50%;border:1px solid rgba(255,255,255,.09);opacity:1;transition:border-color .4s;pointer-events:none}
-body.on .dial::after{border-color:rgba(255,255,255,.1)}
-.ring{position:absolute;inset:0;width:100%;height:100%;transform:rotate(-90deg);fill:none;stroke-width:1.5;opacity:0;transition:opacity .3s;pointer-events:none}
-.ring .track{stroke:var(--line)}
-.ring .arc{stroke:var(--fg);stroke-linecap:round;stroke-dasharray:0 100;transition:stroke-dasharray .5s cubic-bezier(.3,.8,.2,1)}
-body.busy .ring,body.pick .ring,body.on .ring{opacity:1}
-body.busy .dial::after,body.pick .dial::after{border-color:rgba(255,255,255,.03)}
-body.busy .ring .arc,body.pick .ring .arc{stroke-dasharray:14 100;stroke-width:2}
-body.busy .ring,body.pick .ring{animation-duration:1.05s}
-body.on .ring{animation:spin 3.2s linear infinite}
-body.on .ring .arc{stroke-dasharray:26 100;stroke-width:2}
-@keyframes spin{from{transform:rotate(-90deg)}to{transform:rotate(270deg)}}
-.knob{position:relative;width:172px;height:172px;padding:0;aspect-ratio:1;display:grid;place-items:center;border:1px solid #3A3A44;border-radius:50%;background:radial-gradient(120% 120% at 50% 0%,#1E1E23 0%,#141418 55%,#0C0C0F 100%);color:var(--fg);cursor:pointer;overflow:hidden;box-shadow:var(--lift),0 2px 0 rgba(0,0,0,.7),0 26px 50px -30px rgba(0,0,0,.9);transition:background .45s ease,color .35s ease,border-color .35s ease,transform .35s cubic-bezier(.2,.9,.2,1),box-shadow .45s ease}
-/* Блик сверху и тонкая внутренняя кромка — ощущение стекла */
-.knob::before{content:"";position:absolute;inset:0;border-radius:50%;background:radial-gradient(90% 70% at 50% 0%,rgba(255,255,255,.10),transparent 68%);opacity:1;transition:opacity .45s}
-.knob::after{display:none}
-.knob svg{position:relative;width:34px;height:34px;transition:transform .55s cubic-bezier(.2,.9,.2,1),color .35s,opacity .3s}
-.knob svg path{stroke-dasharray:40;stroke-dashoffset:0;transition:stroke-dasharray .6s ease}
-.knob:hover:not(:disabled){border-color:var(--edge-hi);transform:translateY(-2px) scale(1.012);box-shadow:var(--lift),0 2px 0 rgba(0,0,0,.7),0 34px 60px -30px rgba(0,0,0,.95)}
-.knob:hover:not(:disabled) svg{transform:scale(1.06)}
-.knob:active:not(:disabled){transform:scale(.955);transition-duration:.07s}
-/* Волна от точки нажатия */
-.knob .ripple{position:absolute;border-radius:50%;pointer-events:none;background:radial-gradient(circle,rgba(255,255,255,.22),rgba(255,255,255,0) 70%);transform:scale(0);opacity:0}
-
-.knob .ripple.go{animation:ripple .62s cubic-bezier(.2,.7,.2,1) forwards}
-@keyframes ripple{0%{opacity:.85;transform:scale(0)}100%{opacity:0;transform:scale(1)}}
-.knob:focus-visible{outline:none;box-shadow:0 0 0 1px var(--bg),0 0 0 2.5px var(--fg),var(--lift),0 26px 50px -30px rgba(0,0,0,.9)}
+/* Свет от кнопки: загорается вместе с обходом */
+.dial::before{content:"";position:absolute;inset:-18%;border-radius:50%;background:radial-gradient(closest-side,color-mix(in oklch,var(--fg) 15%,transparent),color-mix(in oklch,var(--fg) 4%,transparent) 55%,transparent);opacity:0;transform:scale(.86);transition:opacity .6s var(--ease),transform .8s var(--ease);z-index:-1;pointer-events:none}
+body.on .dial::before{opacity:1;transform:none}
+/* Кольцо замыкается, когда обход включён, и стоит на месте. Крутится только во время
+   переключения, а во время подбора показывает, сколько стратегий уже проверено */
+.ring{position:absolute;inset:0;width:100%;height:100%;transform:rotate(-90deg);fill:none;pointer-events:none}
+.ring .track{stroke:var(--line);stroke-width:1}
+.ring .arc{stroke:var(--fg);stroke-width:1.75;stroke-linecap:round;stroke-dasharray:0 100;opacity:0;transition:stroke-dasharray .7s var(--ease),opacity var(--mid) var(--ease)}
+body.on .ring .arc,body.pick .ring .arc{opacity:1}
+body.on .ring .arc{stroke-dasharray:100 0}
+body.busy .ring{animation:spin 1s linear infinite}
+body.busy .ring .arc{stroke-dasharray:16 84;opacity:1;transition:opacity var(--mid) var(--ease)}
+@keyframes spin{to{transform:rotate(270deg)}}
+.knob{position:relative;width:172px;height:172px;padding:0;display:grid;place-items:center;border:1px solid var(--edge);border-radius:50%;background:radial-gradient(120% 120% at 50% 0%,var(--surface-3),var(--surface) 55%,var(--bg));color:var(--fg-2);cursor:pointer;overflow:hidden;box-shadow:var(--lift),0 2px 0 oklch(0 0 0 / .7),0 26px 50px -30px oklch(0 0 0 / .9);transition:transform var(--slow) var(--spring),color var(--slow) var(--ease),border-color var(--slow) var(--ease)}
+/* Блик сверху: чуть тянется за курсором, как свет на стекле */
+.knob::before{content:"";position:absolute;inset:-8%;border-radius:50%;background:radial-gradient(70% 55% at 50% 6%,color-mix(in oklch,var(--fg) 13%,transparent),transparent 72%);opacity:.75;transform:translate(var(--gx,0px),var(--gy,0px));transition:transform .45s var(--ease),opacity var(--slow) var(--ease);pointer-events:none}
+.knob svg{position:relative;width:34px;height:34px;transition:transform var(--slow) var(--spring)}
+.knob:hover:not(:disabled){transform:translateY(-2px);border-color:var(--edge-hi);color:var(--fg)}
+.knob:active:not(:disabled){transform:scale(.96);transition-duration:.08s}
+.knob:focus-visible{outline:none;box-shadow:0 0 0 2px var(--bg),0 0 0 4px var(--fg),var(--lift)}
 .knob:disabled{cursor:default}
-/* Включено: кнопка остаётся тёмной, включение показывает кольцо */
-body.on .knob{border-color:rgba(255,255,255,.22);box-shadow:var(--lift),0 2px 0 rgba(0,0,0,.7),0 34px 80px -34px rgba(255,255,255,.18)}
+body.on .knob{color:var(--fg);border-color:color-mix(in oklch,var(--fg) 24%,transparent)}
 body.on .knob::before{opacity:1}
-body.busy .knob,body.pick .knob,body.on.busy .knob,body.on.pick .knob{color:var(--fg);background:radial-gradient(120% 120% at 50% 0%,#1E1E23 0%,#141418 55%,#0C0C0F 100%);border-color:#3A3A44;box-shadow:var(--lift),0 2px 0 rgba(0,0,0,.7),0 26px 50px -30px rgba(0,0,0,.9);animation:none}
-body.busy .knob:hover,body.pick .knob:hover{transform:none}
-body.on.busy .knob::before,body.on.pick .knob::before{opacity:1}
-body.busy .ring .track{stroke:#2A2A31}
-body.busy .ring .arc,body.pick .ring .arc{stroke-dasharray:14 100;stroke-width:2}
-@keyframes pulse{50%{opacity:.45;transform:scale(.94)}}
-h1{margin:0;font-size:29px;line-height:1.12;font-weight:500;letter-spacing:-.035em}
-.state-sub{max-width:280px;margin:11px 0 0;color:var(--fg2);font-size:13.5px;line-height:1.45}
+body.on .knob svg{filter:drop-shadow(0 0 8px color-mix(in oklch,var(--fg) 45%,transparent))}
+/* Волна от точки нажатия */
+.knob .ripple{position:absolute;border-radius:50%;pointer-events:none;background:radial-gradient(circle,color-mix(in oklch,var(--fg) 20%,transparent),transparent 70%);transform:scale(0);opacity:0}
+.knob .ripple.go{animation:ripple .6s var(--ease) forwards}
+@keyframes ripple{0%{opacity:.8;transform:scale(0)}100%{opacity:0;transform:scale(1)}}
+h1{margin:0;font-size:29px;line-height:1.12;font-weight:500;letter-spacing:-.035em;white-space:nowrap}
+/* Место под заголовок, три строки подсказки и время работы занято заранее:
+   кнопка не прыгает, когда текст под ней меняется */
+.state-text{width:100%;min-height:130px;display:flex;flex-direction:column;align-items:center}
+.state-sub{max-width:280px;margin:11px 0 0;color:var(--fg-2);font-size:13.5px;line-height:1.45;text-wrap:pretty;transition:color var(--mid) var(--ease)}
 .state-sub.bad{color:var(--fg)}
-.uptime{min-height:18px;margin:9px 0 0;color:var(--fg3);font-size:12.5px}
+.uptime{min-height:18px;margin:9px 0 0;color:var(--fg-3);font-size:12.5px}
 .hero-foot{border-top:1px solid var(--line)}
 
-/* Списки и карточки */
+/* Списки и карточки. Подписи разделов строчными, а не капсом */
 .list{display:flex;flex-direction:column;gap:26px;padding-top:2px}
-.gh{display:flex;align-items:center;gap:9px;height:30px;color:var(--fg2);font-size:12px;letter-spacing:.045em;text-transform:uppercase}
-.gh b{font-weight:500;color:var(--fg2)}
-.gh #checked{letter-spacing:0;text-transform:none;font-size:12.5px;color:var(--fg3)}
+.gh{display:flex;align-items:center;gap:9px;height:30px;margin-bottom:4px;color:var(--fg-2);font-size:13px}
+.gh b{font-weight:500}
+.gh #checked{font-size:12.5px;color:var(--fg-3)}
 .gh .ib{margin-left:auto}
-.group{animation:rise .5s cubic-bezier(.2,.8,.2,1) both;position:relative;border:1px solid var(--line);border-radius:var(--r);background:linear-gradient(180deg,var(--surface),rgba(13,13,15,.55));box-shadow:var(--lift);overflow:hidden}
-.seclist > .gh + .group,.seclist > .gh + .row{border-top:1px solid var(--line)}
-.row{display:flex;align-items:center;gap:13px;min-height:58px;padding:9px 16px;transition:background .22s ease}
-.group .row + .row{border-top:1px solid var(--line)}
-.group > .row:hover,.group .item:hover > .row{background:rgba(255,255,255,.018)}
-.group .item + .item > .row{border-top:1px solid var(--line)}
+.group,.panel{position:relative;border:1px solid var(--line);border-radius:var(--r-card);background:var(--surface);box-shadow:var(--lift);overflow:hidden}
+.row{display:flex;align-items:center;gap:13px;min-height:58px;padding:9px 16px;transition:background-color var(--mid) var(--ease),opacity var(--fast) var(--ease),transform var(--fast) var(--ease)}
+.group .row + .row,.item + .item > .row,.panel > .row + .row{border-top:1px solid var(--line)}
+.group > .row:hover,.item:hover > .row,.panel > .row:hover{background:color-mix(in oklch,var(--fg) 2.5%,transparent)}
+.row.leaving{opacity:0;transform:translateX(12px)}
 .t{flex:1;min-width:0;display:flex;flex-direction:column;gap:3px}
 .t b{font-weight:500;font-size:14px;letter-spacing:-.01em}
-.t span{color:var(--fg2);font-size:12.5px;overflow-wrap:anywhere}
-.t .k{color:var(--fg3);font-size:11.5px;letter-spacing:.045em;text-transform:uppercase;white-space:nowrap}
+.t span{color:var(--fg-2);font-size:12.5px;overflow-wrap:anywhere;text-wrap:pretty}
+.t .k{color:var(--fg-3);font-size:12px;white-space:nowrap}
+/* Строка стратегии одной высоты во всех состояниях: имя в одну строку,
+   сеть на всю ширину под кнопками */
+.row.strat{display:grid;grid-template-columns:minmax(0,1fr) auto auto;align-items:center;column-gap:13px;row-gap:2px;padding-block:11px}
+.strat.picking .t b{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.strat .net{grid-column:1/-1;color:var(--fg-2);font-size:12.5px;overflow-wrap:anywhere;text-wrap:pretty}
 
 /* Статус сайта */
-.st{display:flex;align-items:center;gap:8px;font-size:13px;color:var(--fg);white-space:nowrap}
-.dot{width:6px;height:6px;border-radius:50%;background:var(--fg);box-shadow:0 0 0 3px rgba(255,255,255,.08)}
-.svc.off .st{color:var(--fg3)}
-.svc.off .dot{background:none;box-shadow:inset 0 0 0 1px var(--fg3)}
-.svc.wait .st{color:var(--fg2)}
-.svc.wait .dot{background:var(--fg2);animation:blink 1.2s ease-in-out infinite}
+.st{display:flex;align-items:center;gap:8px;font-size:13px;color:var(--fg);white-space:nowrap;transition:color var(--mid) var(--ease)}
+.dot{width:6px;height:6px;border-radius:50%;background:var(--fg);box-shadow:0 0 0 3px color-mix(in oklch,var(--fg) 8%,transparent)}
+.svc.off .st{color:var(--fg-3)}
+.svc.off .dot{background:none;box-shadow:inset 0 0 0 1px var(--fg-3)}
+.svc.wait .st{color:var(--fg-2)}
+.svc.wait .dot{background:var(--fg-2);animation:blink 1.2s ease-in-out infinite}
 @keyframes blink{50%{opacity:.25}}
 .svc.fail .dot{display:none}
-.svc.fail .st span{padding:3px 9px;border-radius:6px;background:var(--fg);color:var(--bg);font-weight:500;font-size:12.5px}
+.svc.fail .st span{padding:3px 9px;border-radius:6px;background:var(--fg);color:var(--on-fg);font-weight:500;font-size:12.5px}
 .svc.part .dot{background:none;box-shadow:inset 0 0 0 1px var(--fg);border-radius:2px}
 
-/* Кнопки */
-.btn{flex:none;height:32px;padding:0 14px;border:1px solid var(--edge);border-radius:16px;background:linear-gradient(180deg,rgba(255,255,255,.03),transparent);font-size:13px;letter-spacing:-.005em;cursor:pointer;white-space:nowrap;transition:border-color .18s ease,color .18s ease,background .18s ease,transform .22s cubic-bezier(.2,.9,.2,1)}
-.btn:hover:not(:disabled){border-color:var(--edge-hi);background:rgba(255,255,255,.05);transform:translateY(-1px)}
-.btn:active:not(:disabled){transform:translateY(0) scale(.98);transition-duration:.08s}
-.btn:disabled{color:var(--fg3);border-color:var(--line);cursor:default;background:none}
-.btn.primary{position:relative;overflow:hidden;background:var(--fg);border-color:var(--fg);color:var(--bg);font-weight:600;box-shadow:0 10px 26px -14px rgba(255,255,255,.55)}
-.btn.primary::after{content:"";position:absolute;top:0;bottom:0;left:-40%;width:34%;background:linear-gradient(100deg,transparent,rgba(0,0,0,.12),transparent);transform:skewX(-18deg);opacity:0}
-.btn.primary:hover:not(:disabled)::after{animation:sheen .7s ease}
-.btn.primary:hover:not(:disabled){background:var(--fg);border-color:var(--fg);transform:translateY(-1px)}
-.btn.primary:disabled{opacity:.45;box-shadow:none}
-.btn.ghost{border-color:transparent;background:none;color:var(--fg2);padding:0 9px}
+/* Кнопки: капсулы. Нажатие чуть сжимает их, а не дёргает вверх-вниз */
+.btn{flex:none;height:32px;padding:0 14px;border:1px solid var(--edge);border-radius:999px;background:none;font-size:13px;letter-spacing:-.005em;cursor:pointer;white-space:nowrap;transition:border-color var(--fast) var(--ease),background-color var(--fast) var(--ease),color var(--fast) var(--ease),opacity var(--fast) var(--ease),transform var(--mid) var(--spring)}
+.btn:hover:not(:disabled){border-color:var(--edge-hi);background:var(--hover)}
+.btn:active:not(:disabled){transform:scale(.97);transition-duration:.08s}
+.btn:disabled{color:var(--fg-3);border-color:var(--line);background:none;cursor:default}
+.btn.primary{background:var(--fg);border-color:var(--fg);color:var(--on-fg);font-weight:600;box-shadow:0 10px 26px -14px color-mix(in oklch,var(--fg) 55%,transparent)}
+.btn.primary:hover:not(:disabled){background:color-mix(in oklch,var(--fg) 88%,var(--bg));border-color:transparent}
+.btn.primary:disabled{background:var(--fg);border-color:var(--fg);color:var(--on-fg);opacity:.4;box-shadow:none}
+.btn.ghost{border-color:transparent;color:var(--fg-2);padding:0 10px}
 .btn.ghost:hover:not(:disabled){border-color:transparent;background:var(--hover);color:var(--fg)}
-.btn.lg{height:40px;padding:0 20px;border-radius:20px}
-.ib,.x{flex:none;width:30px;height:30px;display:grid;place-items:center;border:0;border-radius:50%;background:none;color:var(--fg2);cursor:pointer;transition:color .15s,background .15s}
+.btn.lg{height:40px;padding:0 20px}
+.ib,.x{flex:none;width:30px;height:30px;display:grid;place-items:center;border:0;border-radius:50%;background:none;color:var(--fg-2);cursor:pointer;transition:color var(--fast),background-color var(--fast),transform var(--mid) var(--spring)}
 .ib svg{width:13px;height:13px}
 .x svg{width:14px;height:14px}
 .ib:hover,.x:hover{color:var(--fg);background:var(--hover)}
+.ib:active,.x:active{transform:scale(.9)}
 .ib:disabled{cursor:default}
 .ib.spin svg{animation:spin2 .9s linear infinite}
 @keyframes spin2{to{transform:rotate(360deg)}}
 
-/* Переключатель */
-.sw{flex:none;position:relative;width:38px;height:22px;padding:0;border:1px solid var(--edge);border-radius:11px;background:rgba(255,255,255,.02);cursor:pointer;box-shadow:inset 0 1px 2px rgba(0,0,0,.6);transition:background .26s ease,border-color .26s ease,box-shadow .3s ease}
-.sw::after{content:"";position:absolute;top:3px;left:3px;width:14px;height:14px;border-radius:50%;background:var(--fg3);box-shadow:0 1px 3px rgba(0,0,0,.6);transition:transform .32s cubic-bezier(.34,1.56,.64,1),background .22s}
-.sw:hover{border-color:var(--fg2)}
-.sw[aria-checked=true]{background:var(--fg);border-color:var(--fg);box-shadow:0 0 20px -6px rgba(255,255,255,.5)}
+/* Переключатель: бегунок едет пружиной и чуть растягивается при нажатии.
+   Пока команда выполняется, он тускнеет только через четверть секунды:
+   быстрые переключения не мигают */
+.sw{flex:none;position:relative;width:40px;height:24px;padding:0;border:0;border-radius:999px;background:color-mix(in oklch,var(--fg) 11%,transparent);box-shadow:inset 0 0 0 1px color-mix(in oklch,var(--fg) 5%,transparent);cursor:pointer;transition:background-color var(--mid) var(--ease),box-shadow var(--mid) var(--ease),opacity var(--fast) var(--ease)}
+.sw::after{content:"";position:absolute;top:3px;left:3px;width:18px;height:18px;border-radius:999px;background:var(--fg-2);box-shadow:0 2px 6px oklch(0 0 0 / .5);transition:transform var(--slow) var(--spring),width var(--mid) var(--ease),background-color var(--mid) var(--ease)}
+.sw:hover:not(:disabled){box-shadow:inset 0 0 0 1px color-mix(in oklch,var(--fg) 16%,transparent)}
+.sw:active:not(:disabled)::after{width:22px}
+.sw[aria-checked=true]{background:var(--fg)}
 .sw[aria-checked=true]::after{transform:translateX(16px);background:var(--bg)}
-.sw:disabled{opacity:.5;cursor:default}
+.sw[aria-checked=true]:active:not(:disabled)::after{transform:translateX(12px)}
+.sw:disabled{opacity:.5;cursor:default;transition:background-color var(--mid) var(--ease),box-shadow var(--mid) var(--ease),opacity var(--mid) var(--ease) .25s}
+.sw:focus-visible{outline-offset:3px}
 
-/* Telegram */
+/* Telegram: кнопки и данные появляются по месту, из прозрачности */
 .more{display:flex;flex-wrap:wrap;gap:8px;padding:0 16px 15px}
-.more .btn.ghost{padding:0 2px}
+.more .btn.ghost{padding:0 4px}
 .kv{padding:0 16px 10px}
+.more,.kv{transition:opacity var(--mid) var(--ease),transform var(--mid) var(--ease),display var(--mid) allow-discrete}
+.more[hidden],.kv[hidden]{opacity:0;transform:translateY(-4px)}
+@starting-style{.more,.kv{opacity:0;transform:translateY(-4px)}}
 .kv .row{min-height:46px;padding:5px 0}
 .kv .t{flex-direction:row;align-items:baseline;gap:13px}
-.kv .t span{width:58px;flex:none;color:var(--fg3);font-size:11.5px;letter-spacing:.045em;text-transform:uppercase}
+.kv .t span{width:58px;flex:none;color:var(--fg-3);font-size:12px}
 .code{font:400 12.5px/1.45 var(--mono);overflow-wrap:anywhere;user-select:text;letter-spacing:0}
 
 /* Сайты */
-.ptitle{margin:0 0 7px;font-size:25px;font-weight:500;letter-spacing:-.03em}
-.lead{margin:0 0 24px;color:var(--fg2);font-size:13.5px;max-width:460px}
+.ptitle{margin:0 0 7px;font-size:25px;font-weight:500;letter-spacing:-.03em;text-wrap:balance}
+.lead{margin:0 0 24px;color:var(--fg-2);font-size:13.5px;max-width:460px;text-wrap:pretty}
 .add{display:flex;gap:14px;margin-bottom:24px}
-.field{flex:1;min-width:0;height:40px;padding:0 2px;border:0;border-bottom:1px solid var(--edge);background:none;color:var(--fg);font:inherit;font-size:14.5px;outline:0;transition:border-color .15s}
-.field::placeholder{color:var(--fg3)}
+.field{flex:1;min-width:0;height:40px;padding:0 2px;border:0;border-bottom:1px solid var(--edge);background:none;color:var(--fg);font:inherit;font-size:14.5px;outline:0;user-select:text;transition:border-color var(--mid) var(--ease)}
+.field::placeholder{color:var(--fg-3)}
 .field:focus{border-bottom-color:var(--fg)}
-.panel{border:1px solid var(--line);border-radius:var(--r);background:var(--surface);box-shadow:var(--lift);overflow:hidden}
-.page > .col > .panel > .item + .item > .row{border-top:1px solid var(--line)}
-.empty{padding:24px 16px;color:var(--fg2);font-size:13.5px}
-.note{margin:15px 0 0;color:var(--fg3);font-size:12.5px}
+.empty{padding:24px 16px;color:var(--fg-2);font-size:13.5px}
+.note{margin:15px 0 0;color:var(--fg-3);font-size:12.5px;text-wrap:pretty}
 
 /* Настройки */
-.label{margin:30px 0 9px;color:var(--fg3);font-size:11.5px;letter-spacing:.06em;text-transform:uppercase}
+.label{margin:30px 0 9px;color:var(--fg-2);font-size:13px;font-weight:500}
 .label:first-of-type{margin-top:4px}
-.log{height:min(340px,42vh);margin:0;padding:14px 16px;overflow:auto;overscroll-behavior:contain;scrollbar-gutter:stable;border:1px solid var(--line);border-radius:var(--r);background:#050506;color:var(--fg2);font:400 11.5px/1.6 var(--mono);white-space:pre-wrap;overflow-wrap:anywhere;user-select:text}
+.log{height:min(340px,42vh);margin:0;padding:14px 16px;overflow:auto;overscroll-behavior:contain;border:1px solid var(--line);border-radius:var(--r-card);background:oklch(.105 .002 286);color:var(--fg-2);font:400 11.5px/1.6 var(--mono);white-space:pre-wrap;overflow-wrap:anywhere;user-select:text}
 .bar{display:flex;gap:9px;margin-top:12px}
 
-/* Окно выбора стратегии */
-dialog{width:min(520px,calc(100% - 48px));max-height:calc(100% - 96px);padding:0;border:1px solid var(--edge);border-radius:18px;background:var(--surface);color:var(--fg);overflow:hidden;box-shadow:0 50px 120px -40px #000,var(--lift)}
-dialog[open]{display:flex;flex-direction:column;animation:pop .18s cubic-bezier(.2,.9,.2,1)}
-@keyframes pop{from{opacity:0;transform:scale(.97) translateY(6px)}}
-dialog::backdrop{background:rgba(0,0,0,.74);backdrop-filter:blur(6px)}
+/* Окно выбора стратегии: стеклянный лист, открывается и закрывается пружиной */
+dialog{width:min(520px,calc(100% - 48px));max-height:calc(100% - 96px);padding:0;border:1px solid var(--glass-edge);border-radius:var(--r-sheet);background:color-mix(in oklch,var(--surface) 80%,transparent);-webkit-backdrop-filter:var(--blur);backdrop-filter:var(--blur);color:var(--fg);overflow:hidden;box-shadow:var(--glass-hi),0 40px 100px -30px oklch(0 0 0 / .9)}
+dialog[open]{display:flex;flex-direction:column;animation:sheetin var(--slow) var(--spring)}
+dialog::backdrop{background:oklch(0 0 0 / .5);animation:fadein var(--mid) var(--ease)}
+dialog.closing{animation:sheetout .18s var(--ease) forwards}
+dialog.closing::backdrop{animation:fadeout .18s var(--ease) forwards}
+@keyframes sheetin{from{opacity:0;transform:translateY(10px) scale(.96)}}
+@keyframes sheetout{to{opacity:0;transform:translateY(6px) scale(.97)}}
+@keyframes fadein{from{opacity:0}}
+@keyframes fadeout{to{opacity:0}}
 .dlg-h{display:flex;align-items:center;padding:20px 16px 0 24px}
 .dlg-h h3{flex:1;margin:0;font-size:18px;font-weight:500;letter-spacing:-.02em}
-.dlg-sub{margin:9px 24px 16px;color:var(--fg2);font-size:13px}
-.dlg-list{overflow:auto;padding:0 24px 16px}
-.opt{display:flex;align-items:center;gap:15px;min-height:60px;padding:9px 0;border-top:1px solid var(--line);cursor:pointer;transition:padding .15s}
-.opt:hover{padding-left:4px;padding-right:4px}
-.opt:hover .t b{text-decoration:underline;text-underline-offset:3px;text-decoration-thickness:1px}
-.radio{flex:none;width:15px;height:15px;border:1px solid var(--edge);border-radius:50%}
-.opt.sel .radio{border-color:var(--fg);box-shadow:inset 0 0 0 3px var(--surface);background:var(--fg)}
+.dlg-sub{margin:9px 24px 14px;color:var(--fg-2);font-size:13px;text-wrap:pretty}
+.dlg-list{overflow:auto;padding:0 12px 12px}
+.opt{display:flex;align-items:center;gap:15px;min-height:60px;padding:9px 12px;border-radius:10px;cursor:pointer;transition:background-color var(--fast) var(--ease),transform var(--mid) var(--spring)}
+.opt + .opt{margin-top:2px}
+.opt:hover{background:var(--hover)}
+.opt:active{transform:scale(.985)}
+.opt.sel{background:color-mix(in oklch,var(--fg) 7%,transparent)}
+.radio{flex:none;position:relative;width:16px;height:16px;border:1px solid var(--edge-hi);border-radius:50%}
+.radio::after{content:"";position:absolute;inset:3px;border-radius:50%;background:var(--fg);transform:scale(0);transition:transform var(--slow) var(--spring)}
+.opt.sel .radio{border-color:var(--fg)}
+.opt.sel .radio::after{transform:none}
 .res{flex:none;font-size:12.5px;color:var(--fg)}
-.res.wait{color:var(--fg2)}
-.res.bad{padding:3px 9px;border-radius:6px;background:var(--fg);color:var(--bg);font-weight:500}
+.res.wait{color:var(--fg-2)}
+.res.bad{padding:3px 9px;border-radius:6px;background:var(--fg);color:var(--on-fg);font-weight:500}
 
-.toast{position:fixed;left:50%;bottom:24px;max-width:calc(100% - 48px);padding:11px 17px;border:1px solid rgba(255,255,255,.14);border-radius:10px;background:var(--fg);color:var(--bg);font-size:13px;font-weight:500;box-shadow:0 24px 60px -24px #000;transform:translate(-50%,10px);opacity:0;pointer-events:none;transition:opacity .22s ease,transform .3s cubic-bezier(.2,.9,.2,1);z-index:20}
+/* Уведомление: стеклянная капсула снизу */
+.toast{position:fixed;left:50%;bottom:22px;max-width:calc(100% - 48px);padding:10px 18px;border:1px solid var(--glass-edge);border-radius:20px;background:color-mix(in oklch,var(--surface-2) 74%,transparent);-webkit-backdrop-filter:var(--blur);backdrop-filter:var(--blur);color:var(--fg);font-size:13px;font-weight:500;text-align:center;text-wrap:balance;box-shadow:var(--glass-hi),var(--glass-shadow);transform:translate(-50%,16px) scale(.96);opacity:0;pointer-events:none;transition:opacity var(--mid) var(--ease),transform var(--slow) var(--spring);z-index:20}
 .toast.show{opacity:1;transform:translate(-50%,0)}
 
-::-webkit-scrollbar{width:11px;height:11px}
-::-webkit-scrollbar-thumb{background:#24242A;border:3px solid var(--bg);border-radius:7px}
-::-webkit-scrollbar-thumb:hover{background:#3C3C44}
+/* Тонкие полосы прокрутки; у страниц полоса начинается под шапкой */
+::-webkit-scrollbar{width:10px;height:10px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:color-mix(in oklch,var(--fg) 12%,transparent);border:3px solid transparent;background-clip:padding-box;border-radius:999px}
+::-webkit-scrollbar-thumb:hover{background-color:color-mix(in oklch,var(--fg) 22%,transparent)}
+.page::-webkit-scrollbar-track{margin-top:54px}
 
-@media (max-width:720px){.dash{gap:30px;grid-template-columns:minmax(220px,250px) minmax(0,1fr)}.page{padding:26px 26px 30px}.dial{width:190px;height:190px}}
-@media (prefers-reduced-motion: reduce){
+@media (max-width:720px){.dash{gap:30px;grid-template-columns:minmax(220px,250px) minmax(0,1fr)}.page{padding:78px 26px 30px}.dial{width:190px;height:190px}}
+@supports not ((backdrop-filter:blur(1px)) or (-webkit-backdrop-filter:blur(1px))){
+  .top::before,dialog,.toast{background:var(--surface-2)}
+}
+/* «Уменьшить прозрачность»: стекло становится сплошной поверхностью того же тона */
+@media (prefers-reduced-transparency:reduce){
+  .top::before,dialog,.toast{-webkit-backdrop-filter:none;backdrop-filter:none;background:var(--surface-2)}
+  body.mica{background:var(--bg)}
+}
+@media (prefers-reduced-motion:reduce){
+  *,*::before,*::after{animation-duration:.01ms!important;animation-iteration-count:1!important;transition-duration:.01ms!important;transition-delay:0s!important}
   body::before{display:none}
-  .svc.wait .dot{animation:none}
-  .knob:hover:not(:disabled){transform:none}
-  .page.on .list > *,.page.on .col > *,.page.on .list > .group{animation-delay:0s}
-  .btn.primary:hover:not(:disabled)::after{animation:none}
 }
 </style>
 </head>
@@ -275,9 +311,11 @@ dialog::backdrop{background:rgba(0,0,0,.74);backdrop-filter:blur(6px)}
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" aria-hidden="true"><path d="M12 3v8.5"/><path d="M17.9 6.6a8.4 8.4 0 1 1-11.85.05"/></svg>
             </button>
           </div>
-          <h1 id="state" aria-live="polite">Обход выключен</h1>
-          <p class="state-sub" id="stateSub">Нажмите, чтобы открылись Discord и YouTube.</p>
-          <p class="uptime" id="uptime"></p>
+          <div class="state-text">
+            <h1 id="state" aria-live="polite">Обход выключен</h1>
+            <p class="state-sub" id="stateSub">Нажмите, чтобы открылись Discord и YouTube.</p>
+            <p class="uptime" id="uptime"></p>
+          </div>
         </div>
         <div class="hero-foot">
           <div class="row" id="asRow">
@@ -294,9 +332,10 @@ dialog::backdrop{background:rgba(0,0,0,.74);backdrop-filter:blur(6px)}
           <div class="row svc off" id="svc-dc"><div class="t"><b>Discord</b></div><span class="st"><i class="dot"></i><span id="st-dc">Выключено</span></span></div>
           <div class="row svc off" id="svc-yt"><div class="t"><b>YouTube</b></div><span class="st"><i class="dot"></i><span id="st-yt">Выключено</span></span></div>
           <div class="row strat" id="stratRow">
-            <div class="t"><span class="k">Стратегия</span><b id="stratName">Основная</b><span id="stratNet" hidden></span></div>
+            <div class="t"><span class="k" id="stratK">Стратегия</span><b id="stratName">Основная</b></div>
             <button class="btn ghost" id="stratOpen">Выбрать</button>
             <button class="btn" id="pickBtn">Подобрать</button>
+            <span class="net" id="stratNet" hidden></span>
           </div>
           </div>
         </div>
