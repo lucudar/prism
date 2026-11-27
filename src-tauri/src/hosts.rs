@@ -1,5 +1,7 @@
 //! Доступ к нейросетям: адреса из публичного списка ImMALWARE/dns.malw.link
 //! записываются в файл hosts Windows. Берём только разделы с нейросетями.
+//! Файл читается и пишется байтами: в hosts бывают комментарии в Windows-1251,
+//! и чужие строки должны остаться ровно такими, какими были.
 
 use std::fs;
 use std::path::PathBuf;
@@ -15,10 +17,24 @@ pub fn hosts_path() -> PathBuf {
     crate::secure::system_dir().join("drivers").join("etc").join("hosts")
 }
 
+/// Прочитать hosts как есть. Файла нет: он пустой. Другая ошибка: файл не трогаем,
+/// иначе запись по пустому содержимому стёрла бы все чужие строки.
+fn read_hosts() -> Result<Vec<u8>, String> {
+    match fs::read(hosts_path()) {
+        Ok(b) => Ok(b),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(format!("Не удалось прочитать файл hosts: {e}")),
+    }
+}
+
+fn contains(hay: &[u8], needle: &[u8]) -> bool {
+    hay.windows(needle.len()).any(|w| w == needle)
+}
+
 /// Есть ли в hosts блок Prism. Его мог убрать деинсталлятор при переустановке
 /// или антивирус, тогда Prism записывает его заново.
 pub fn present() -> bool {
-    fs::read_to_string(hosts_path()).map(|t| t.contains(START)).unwrap_or(false)
+    fs::read(hosts_path()).map(|b| contains(&b, START.as_bytes())).unwrap_or(false)
 }
 
 /// Оставить из списка только нужные разделы и строки «IP домен».
@@ -59,35 +75,51 @@ fn block_line(line: &str) -> bool {
     matches!((it.next(), it.next(), it.next()), (Some(ip), Some(host), None) if ip.parse::<std::net::IpAddr>().is_ok() && host.contains('.'))
 }
 
-fn strip_block(text: &str) -> String {
-    let lines: Vec<&str> = text.lines().collect();
-    let mut out = Vec::new();
+/// Строка без пробелов по краям. Только ASCII: байты других кодировок не задеваются.
+fn trim(l: &[u8]) -> &[u8] {
+    let start = l.iter().position(|b| !b.is_ascii_whitespace()).unwrap_or(l.len());
+    let end = l.iter().rposition(|b| !b.is_ascii_whitespace()).map_or(start, |i| i + 1);
+    &l[start..end]
+}
+
+/// Строка, похожая на нашу. Не UTF-8, значит, точно не наша.
+fn ours(l: &[u8]) -> bool {
+    std::str::from_utf8(l).map(block_line).unwrap_or(false)
+}
+
+fn strip_block(text: &[u8]) -> Vec<u8> {
+    let lines: Vec<&[u8]> = text
+        .split(|&b| b == b'\n')
+        .map(|l| if l.last() == Some(&b'\r') { &l[..l.len() - 1] } else { l })
+        .collect();
+    let (start, end) = (START.as_bytes(), END.as_bytes());
+    let mut out: Vec<&[u8]> = Vec::new();
     let mut i = 0;
     while i < lines.len() {
-        if lines[i].trim() != START {
+        if trim(lines[i]) != start {
             out.push(lines[i]);
             i += 1;
             continue;
         }
-        match lines[i + 1..].iter().position(|l| l.trim() == END) {
+        match lines[i + 1..].iter().position(|l| trim(l) == end) {
             Some(n) => i += n + 2,
             // Конец блока стёрли вручную: убираем только строки, похожие на наши,
             // и останавливаемся на первой чужой, чтобы не стереть остаток файла.
             None => {
                 i += 1;
-                while i < lines.len() && block_line(lines[i]) {
+                while i < lines.len() && ours(lines[i]) {
                     i += 1;
                 }
             }
         }
     }
-    while out.last().map(|l| l.trim().is_empty()).unwrap_or(false) {
+    while out.last().map(|l| trim(l).is_empty()).unwrap_or(false) {
         out.pop();
     }
-    out.join("\r\n")
+    out.join(&b"\r\n"[..])
 }
 
-fn write_hosts(body: &str) -> Result<(), String> {
+fn write_hosts(body: &[u8]) -> Result<(), String> {
     let p = hosts_path();
     if let Ok(meta) = fs::metadata(&p) {
         let mut perm = meta.permissions();
@@ -126,22 +158,28 @@ pub async fn download() -> Result<String, String> {
 }
 
 pub fn enable(list: &str) -> Result<(), String> {
-    let current = fs::read_to_string(hosts_path()).unwrap_or_default();
-    let body = format!("{}\r\n\r\n{START}\r\n{list}\r\n{END}\r\n", strip_block(&current));
+    let mut body = strip_block(&read_hosts()?);
+    body.extend_from_slice(format!("\r\n\r\n{START}\r\n{list}\r\n{END}\r\n").as_bytes());
     write_hosts(&body)
 }
 
 pub fn disable() -> Result<(), String> {
-    let current = fs::read_to_string(hosts_path()).unwrap_or_default();
-    if !current.contains(START) {
+    let current = read_hosts()?;
+    if !contains(&current, START.as_bytes()) {
         return Ok(());
     }
-    write_hosts(&format!("{}\r\n", strip_block(&current)))
+    let mut body = strip_block(&current);
+    body.extend_from_slice(b"\r\n");
+    write_hosts(&body)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn strip(t: &str) -> String {
+        String::from_utf8(strip_block(t.as_bytes())).unwrap()
+    }
 
     #[test]
     fn filters_sections() {
@@ -155,14 +193,23 @@ mod tests {
     #[test]
     fn strips_block() {
         let t = format!("127.0.0.1 localhost\r\n\r\n{START}\r\n1.1.1.1 a.com\r\n{END}\r\n");
-        assert_eq!(strip_block(&t), "127.0.0.1 localhost");
+        assert_eq!(strip(&t), "127.0.0.1 localhost");
         let mid = format!("1.1.1.1 a.com\r\n{START}\r\n# OpenAI\r\n2.2.2.2 chatgpt.com\r\n{END}\r\n3.3.3.3 b.com\r\n");
-        assert_eq!(strip_block(&mid), "1.1.1.1 a.com\r\n3.3.3.3 b.com");
+        assert_eq!(strip(&mid), "1.1.1.1 a.com\r\n3.3.3.3 b.com");
     }
 
     #[test]
     fn keeps_rest_without_end_marker() {
         let t = format!("127.0.0.1 localhost\r\n{START}\r\n# OpenAI\r\n2.2.2.2 chatgpt.com\r\n\r\n# Моё\r\n10.0.0.5 nas.local\r\n");
-        assert_eq!(strip_block(&t), "127.0.0.1 localhost\r\n\r\n# Моё\r\n10.0.0.5 nas.local");
+        assert_eq!(strip(&t), "127.0.0.1 localhost\r\n\r\n# Моё\r\n10.0.0.5 nas.local");
+    }
+
+    #[test]
+    fn keeps_other_encodings() {
+        // «Мой NAS» в Windows-1251: строка не в UTF-8, но она чужая и остаётся байт в байт.
+        let mut t = b"127.0.0.1 localhost\r\n# \xcc\xee\xe9 NAS\r\n".to_vec();
+        t.extend_from_slice(format!("{START}\r\n# OpenAI\r\n2.2.2.2 chatgpt.com\r\n{END}\r\n").as_bytes());
+        assert!(contains(&t, START.as_bytes()));
+        assert_eq!(strip_block(&t), b"127.0.0.1 localhost\r\n# \xcc\xee\xe9 NAS".to_vec());
     }
 }
