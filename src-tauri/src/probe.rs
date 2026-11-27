@@ -9,7 +9,13 @@ use serde::Serialize;
 
 #[derive(Clone, Serialize, Default)]
 pub struct Check {
+    /// Сервис работает: ответили все обязательные адреса. По нему судит подбор.
+    #[serde(skip)]
     pub ok: bool,
+    /// Ответил хоть один адрес. В окно уходит под именем ok: окно само покажет
+    /// «N из M», если ответили не все, и «Не открывается», только если молчат все.
+    #[serde(rename = "ok")]
+    pub seen: bool,
     pub ms: u64,
     /// Сколько сайтов из проверенных ответили. Для YouTube это важно:
     /// страница может открываться, а видео с googlevideo.com — нет.
@@ -55,11 +61,71 @@ fn reason(e: &reqwest::Error) -> String {
 
 /// Открыть адрес и прочитать ответ. Возвращает, за сколько миллисекунд он открылся.
 async fn fetch(c: &reqwest::Client, url: &str) -> Result<u64, String> {
+    fetch_len(c, url).await.map(|(ms, _)| ms)
+}
+
+/// То же, но вместе с размером ответа.
+async fn fetch_len(c: &reqwest::Client, url: &str) -> Result<(u64, usize), String> {
     let t = Instant::now();
     let r = c.get(url).send().await.map_err(|e| reason(&e))?;
     // Читаем и тело: DPI часто рвёт соединение уже после заголовков.
-    r.bytes().await.map_err(|e| reason(&e))?;
-    Ok(t.elapsed().as_millis() as u64)
+    let body = r.bytes().await.map_err(|e| reason(&e))?;
+    Ok((t.elapsed().as_millis() as u64, body.len()))
+}
+
+/// Одна проверка сервиса.
+pub struct Probe<'a> {
+    /// Название для журнала.
+    pub name: &'a str,
+    pub url: &'a str,
+    /// Без этого адреса сервисом не пользоваться: например, чат Discord без шлюза
+    /// или YouTube, где страница открывается, а видео нет.
+    pub need: bool,
+    /// Сколько байт нужно получить. DPI часто пропускает первые ~16 КБ и только
+    /// потом замораживает соединение, а провайдер может отдать вместо сайта
+    /// свою страницу-заглушку. Короткий ответ на таком адресе — провал.
+    pub min: usize,
+}
+
+/// Проверить адреса одновременно и подвести итог. Сервис работает, если ответил
+/// хотя бы один адрес и все обязательные. Раньше хватало любого ответа, и подбор
+/// выбирал стратегии, где сайт открывается, а видео или голос — нет.
+pub async fn group(c: &reqwest::Client, probes: &[Probe<'_>]) -> Check {
+    let tasks: Vec<_> = probes
+        .iter()
+        .map(|p| {
+            let (c, url) = (c.clone(), p.url.to_string());
+            tokio::spawn(async move { fetch_len(&c, &url).await })
+        })
+        .collect();
+    let mut results = Vec::with_capacity(tasks.len());
+    for t in tasks {
+        results.push(t.await.unwrap_or_else(|_| Err("проверка прервалась".into())));
+    }
+    tally(probes, &results)
+}
+
+/// Итог по результатам проверок, в том же порядке, что и сами проверки.
+fn tally(probes: &[Probe<'_>], results: &[Result<(u64, usize), String>]) -> Check {
+    let mut good = 0u8;
+    let mut best = 0u64;
+    let mut need_ok = true;
+    let mut failed = Vec::new();
+    for (p, r) in probes.iter().zip(results) {
+        let err = match r {
+            Ok((ms, len)) if *len >= p.min => {
+                good += 1;
+                best = if best == 0 { *ms } else { best.min(*ms) };
+                continue;
+            }
+            Ok((_, len)) => format!("{} ({} КБ из {}, соединение оборвалось или это заглушка)", p.name, len / 1024, p.min / 1024),
+            Err(e) => format!("{} ({e})", p.name),
+        };
+        need_ok &= !p.need;
+        failed.push(err);
+    }
+    let ok = good > 0 && need_ok;
+    Check { ok, seen: good > 0, ms: if good > 0 { best } else { 0 }, good, total: probes.len() as u8, failed }
 }
 
 /// Один адрес отвечает, если получили любой HTTP-ответ: DPI чаще режет
@@ -67,7 +133,7 @@ async fn fetch(c: &reqwest::Client, url: &str) -> Result<u64, String> {
 #[allow(dead_code)]
 pub async fn http(c: &reqwest::Client, url: &str) -> Check {
     match fetch(c, url).await {
-        Ok(ms) => Check { ok: true, ms, ..Default::default() },
+        Ok(ms) => Check { ok: true, seen: true, ms, ..Default::default() },
         Err(_) => Check::default(),
     }
 }
@@ -79,34 +145,15 @@ pub async fn http(c: &reqwest::Client, url: &str) -> Check {
 /// стратегии подбор ждал таймаут каждого адреса подряд, а потом ещё раз
 /// перепроверял YouTube, чтобы узнать причину. Теперь причина собирается сразу.
 pub async fn any(c: &reqwest::Client, urls: &[(&str, &str)]) -> Check {
-    let tasks: Vec<_> = urls
-        .iter()
-        .map(|(name, url)| {
-            let (c, name, url) = (c.clone(), name.to_string(), url.to_string());
-            tokio::spawn(async move { (name, fetch(&c, &url).await) })
-        })
-        .collect();
-    let mut good = 0u8;
-    let mut best = 0u64;
-    let mut failed = Vec::new();
-    for t in tasks {
-        match t.await {
-            Ok((_, Ok(ms))) => {
-                good += 1;
-                best = if best == 0 { ms } else { best.min(ms) };
-            }
-            Ok((name, Err(e))) => failed.push(format!("{name} ({e})")),
-            Err(_) => failed.push("проверка прервалась".into()),
-        }
-    }
-    let total = urls.len() as u8;
-    Check { ok: good > 0, ms: if good > 0 { best } else { 0 }, good, total, failed }
+    let probes: Vec<Probe> = urls.iter().map(|&(name, url)| Probe { name, url, need: false, min: 0 }).collect();
+    group(c, &probes).await
 }
 
 pub async fn tcp(port: u16) -> Check {
     let t = Instant::now();
     let r = tokio::time::timeout(Duration::from_secs(2), tokio::net::TcpStream::connect(("127.0.0.1", port))).await;
-    Check { ok: matches!(r, Ok(Ok(_))), ms: t.elapsed().as_millis() as u64, ..Default::default() }
+    let ok = matches!(r, Ok(Ok(_)));
+    Check { ok, seen: ok, ms: t.elapsed().as_millis() as u64, ..Default::default() }
 }
 
 /// Адреса YouTube: название для журнала, сайт и путь. Страница сайта, видеосервер
@@ -250,20 +297,34 @@ pub async fn services(timeout: u64, dns: &Dns) -> Services {
     Services { discord, youtube }
 }
 
+/// Discord: api, шлюз чата, картинки и голос. Голосовые серверы живут на
+/// discord.media, его режут отдельно от чата: чат пишет, а в войсе «Подключение к RTC».
+/// Обязательны шлюз и голос.
+const DISCORD: [Probe<'static>; 4] = [
+    Probe { name: "api", url: "https://discord.com/api/v9/experiments", need: false, min: 0 },
+    Probe { name: "шлюз", url: "https://gateway.discord.gg/?v=10&encoding=json", need: true, min: 0 },
+    Probe { name: "картинки", url: "https://cdn.discordapp.com/embed/avatars/0.png", need: false, min: 0 },
+    Probe { name: "голос", url: "https://latency.discord.media/rtc", need: true, min: 0 },
+];
+
+/// Картинка с i.ytimg.com больше 16 КБ: на ней видно, что DPI не замораживает
+/// соединение посередине, как бывает с видео. Сам поток googlevideo без подписи
+/// плеера не скачать, поэтому проверяем так.
+const YT_BULK: &str = "https://i.ytimg.com/vi/dQw4w9WgXcQ/maxresdefault.jpg";
+const YT_BULK_MIN: usize = 24 * 1024;
+
 pub async fn discord_checks(c: &reqwest::Client) -> Check {
-    any(c, &[
-        ("api", "https://discord.com/api/v9/experiments"),
-        ("шлюз", "https://gateway.discord.gg/?v=10&encoding=json"),
-    ])
-    .await
+    group(c, &DISCORD).await
 }
 
-/// Сайт, видеосервер и api YouTube. Что не открылось и почему, видно в `failed`:
-/// так понятно, что именно режет провайдер.
+/// Сайт, видеосервер, api и крупная картинка YouTube. Что не открылось и почему,
+/// видно в `failed`: так понятно, что именно режет провайдер. Обязательны
+/// видеосервер и крупная картинка: без них видео не грузится или встаёт.
 pub async fn youtube_checks(c: &reqwest::Client) -> Check {
     let owned = YOUTUBE.map(|(name, host, path)| (name, format!("https://{host}{path}")));
-    let urls: Vec<(&str, &str)> = owned.iter().map(|(n, u)| (*n, u.as_str())).collect();
-    any(c, &urls).await
+    let mut probes: Vec<Probe> = owned.iter().map(|(n, u)| Probe { name: *n, url: u.as_str(), need: *n == "видеосервер", min: 0 }).collect();
+    probes.push(Probe { name: "поток", url: YT_BULK, need: true, min: YT_BULK_MIN });
+    group(c, &probes).await
 }
 
 /// Итог сравнения DNS Windows с безопасным DNS для www.youtube.com.
@@ -341,7 +402,7 @@ mod tests {
 
     #[test]
     fn counts_partial() {
-        let c = Check { ok: true, ms: 10, good: 2, total: 3, ..Default::default() };
+        let c = Check { ok: true, seen: true, ms: 10, good: 2, total: 3, ..Default::default() };
         assert!(c.ok && c.good < c.total);
     }
 
@@ -374,5 +435,28 @@ mod tests {
         assert!(!r.ok);
         assert_eq!(r.failed.len(), 2);
         assert!(t.elapsed() < Duration::from_millis(1900), "проверки шли по очереди");
+    }
+
+    #[test]
+    fn needs_required() {
+        let p = |name, need, min| Probe { name, url: "", need, min };
+        let probes = [p("сайт", false, 0), p("видео", true, 0), p("поток", true, 1000)];
+        let all: Vec<Result<(u64, usize), String>> = vec![Ok((50, 10)), Ok((30, 10)), Ok((80, 5000))];
+        let c = tally(&probes, &all);
+        assert!(c.ok && c.good == 3 && c.total == 3 && c.ms == 30);
+        // Сайт открылся, видео нет: раньше это считалось рабочим.
+        let c = tally(&probes, &[Ok((50, 10)), Err("нет ответа".into()), Ok((80, 5000))]);
+        assert!(!c.ok && c.seen && c.good == 2);
+        // В окно уходит «ответил хоть кто-то», чтобы там было «2 из 3», а не «Не открывается».
+        assert_eq!(serde_json::to_value(&c).unwrap()["ok"], true);
+        assert_eq!(c.failed, vec!["видео (нет ответа)"]);
+        // Ответ короче нужного: заглушка провайдера или замороженное соединение.
+        let c = tally(&probes, &[Ok((50, 10)), Ok((30, 10)), Ok((80, 999))]);
+        assert!(!c.ok && c.good == 2 && c.failed[0].starts_with("поток (0 КБ"));
+        // Без обязательных адресов достаточно любого ответа, как раньше.
+        let opt = [p("a", false, 0), p("b", false, 0)];
+        assert!(tally(&opt, &[Err("x".into()), Ok((5, 0))]).ok);
+        assert!(!tally(&opt, &[Err("x".into()), Err("y".into())]).ok);
+        assert!(DISCORD.iter().filter(|p| p.need).count() == 2);
     }
 }
