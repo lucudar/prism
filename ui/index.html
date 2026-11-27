@@ -126,7 +126,10 @@ body.on .knob svg{filter:drop-shadow(0 0 8px color-mix(in oklch,var(--fg) 45%,tr
 .knob .ripple{position:absolute;border-radius:50%;pointer-events:none;background:radial-gradient(circle,color-mix(in oklch,var(--fg) 20%,transparent),transparent 70%);transform:scale(0);opacity:0}
 .knob .ripple.go{animation:ripple .6s var(--ease) forwards}
 @keyframes ripple{0%{opacity:.8;transform:scale(0)}100%{opacity:0;transform:scale(1)}}
-h1{margin:0;font-size:29px;line-height:1.12;font-weight:500;letter-spacing:-.035em;text-wrap:balance}
+h1{margin:0;font-size:29px;line-height:1.12;font-weight:500;letter-spacing:-.035em;white-space:nowrap}
+/* Место под заголовок, три строки подсказки и время работы занято заранее:
+   кнопка не прыгает, когда текст под ней меняется */
+.state-text{width:100%;min-height:130px;display:flex;flex-direction:column;align-items:center}
 .state-sub{max-width:280px;margin:11px 0 0;color:var(--fg-2);font-size:13.5px;line-height:1.45;text-wrap:pretty;transition:color var(--mid) var(--ease)}
 .state-sub.bad{color:var(--fg)}
 .uptime{min-height:18px;margin:9px 0 0;color:var(--fg-3);font-size:12.5px}
@@ -147,6 +150,11 @@ h1{margin:0;font-size:29px;line-height:1.12;font-weight:500;letter-spacing:-.035
 .t b{font-weight:500;font-size:14px;letter-spacing:-.01em}
 .t span{color:var(--fg-2);font-size:12.5px;overflow-wrap:anywhere;text-wrap:pretty}
 .t .k{color:var(--fg-3);font-size:12px;white-space:nowrap}
+/* Строка стратегии одной высоты во всех состояниях: имя в одну строку,
+   сеть на всю ширину под кнопками */
+.row.strat{display:grid;grid-template-columns:minmax(0,1fr) auto auto;align-items:center;column-gap:13px;row-gap:2px;padding-block:11px}
+.strat.picking .t b{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.strat .net{grid-column:1/-1;color:var(--fg-2);font-size:12.5px;overflow-wrap:anywhere;text-wrap:pretty}
 
 /* Статус сайта */
 .st{display:flex;align-items:center;gap:8px;font-size:13px;color:var(--fg);white-space:nowrap;transition:color var(--mid) var(--ease)}
@@ -303,9 +311,11 @@ dialog.closing::backdrop{animation:fadeout .18s var(--ease) forwards}
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" aria-hidden="true"><path d="M12 3v8.5"/><path d="M17.9 6.6a8.4 8.4 0 1 1-11.85.05"/></svg>
             </button>
           </div>
-          <h1 id="state" aria-live="polite">Обход выключен</h1>
-          <p class="state-sub" id="stateSub">Нажмите, чтобы открылись Discord и YouTube.</p>
-          <p class="uptime" id="uptime"></p>
+          <div class="state-text">
+            <h1 id="state" aria-live="polite">Обход выключен</h1>
+            <p class="state-sub" id="stateSub">Нажмите, чтобы открылись Discord и YouTube.</p>
+            <p class="uptime" id="uptime"></p>
+          </div>
         </div>
         <div class="hero-foot">
           <div class="row" id="asRow">
@@ -322,9 +332,10 @@ dialog.closing::backdrop{animation:fadeout .18s var(--ease) forwards}
           <div class="row svc off" id="svc-dc"><div class="t"><b>Discord</b></div><span class="st"><i class="dot"></i><span id="st-dc">Выключено</span></span></div>
           <div class="row svc off" id="svc-yt"><div class="t"><b>YouTube</b></div><span class="st"><i class="dot"></i><span id="st-yt">Выключено</span></span></div>
           <div class="row strat" id="stratRow">
-            <div class="t"><span class="k">Стратегия</span><b id="stratName">Основная</b><span id="stratNet" hidden></span></div>
+            <div class="t"><span class="k" id="stratK">Стратегия</span><b id="stratName">Основная</b></div>
             <button class="btn ghost" id="stratOpen">Выбрать</button>
             <button class="btn" id="pickBtn">Подобрать</button>
+            <span class="net" id="stratNet" hidden></span>
           </div>
           </div>
         </div>

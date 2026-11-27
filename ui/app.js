@@ -417,7 +417,7 @@ function render() {
   const partial = [['Discord', dc], ['YouTube', yt]].filter(([, x]) => x[0] === 'part').map(([n]) => n);
   const sub = $('#stateSub');
   const total = S.strategies.length, done = Object.values(pick).filter(r => r.state !== 'wait').length;
-  setText($('#state'), busyText || (picking ? (stopping ? 'Останавливаю подбор' : 'Подбираю стратегию') : on ? 'Обход включён' : 'Обход выключен'), true);
+  setText($('#state'), busyText || (picking ? (stopping ? 'Завершаю подбор' : 'Подбираю стратегию') : on ? 'Обход включён' : 'Обход выключен'), true);
   setClass(sub, 'state-sub' + ((failed.length || partial.length || dnsBad) && !busyText && !picking ? ' bad' : ''));
   setText(sub, busyText ? 'Это займёт пару секунд.'
     : picking && stopping ? 'Допроверяю текущую стратегию и включу лучшую из проверенных.'
@@ -437,16 +437,22 @@ function render() {
   // Стратегия и подбор
   const strat = S.strategies.find(x => x.id === S.strategy);
   const cur = S.strategies.find(x => pick[x.id] && pick[x.id].state === 'wait');
-  setText($('#stratName'), !total ? 'Не найдены. Переустановите Prism'
-    : picking ? (cur ? `Проверяю «${cur.name}»` : 'Готовлю проверку') : (strat ? strat.name : S.strategy), true);
+  // Во время подбора подпись говорит, что идёт проверка, а в строке только имя:
+  // так оно влезает в одну строку и строка не меняет высоту.
+  setText($('#stratK'), picking ? (cur ? 'Проверяю' : 'Подбор') : 'Стратегия');
+  const sName = !total ? 'Не найдены. Переустановите Prism'
+    : picking ? (cur ? cur.name : 'Готовлю проверку') : (strat ? strat.name : S.strategy);
+  setText($('#stratName'), sName, true);
+  setAttr($('#stratName'), 'title', sName);
+  $('#stratRow').classList.toggle('picking', !!picking);
   // Сеть, для которой запомнена стратегия: в другой сети Prism включит свою.
   const sn = $('#stratNet');
-  setHidden(sn, picking || !S.network);
-  setText(sn, S.profile ? `Запомнена для сети «${S.network}»` : `Сеть «${S.network}»`);
+  setHidden(sn, !S.network);
+  setText(sn, picking ? `Запомню для сети «${S.network}»` : S.profile ? `Запомнена для сети «${S.network}»` : `Сеть «${S.network}»`);
   const d = picking ? `${Math.max(2, Math.round(done / Math.max(total, 1) * 100))} 100` : '';
   if (d !== dash) { dash = d; $('#arc').style.strokeDasharray = d; }
   const pb = $('#pickBtn');
-  setText(pb, picking ? (stopping ? 'Останавливаю…' : 'Стоп') : 'Подобрать');
+  setText(pb, picking ? 'Стоп' : 'Подобрать');
   setClass(pb, 'btn' + (failed.length && !picking ? ' primary' : ''));
   pb.disabled = picking ? stopping : !!(busy || !total);
   $('#stratOpen').disabled = picking || !total;
