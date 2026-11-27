@@ -1,7 +1,9 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod cleanup;
 mod engine;
 mod hosts;
+mod net;
 mod probe;
 mod secure;
 mod settings;
@@ -15,8 +17,10 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
-use tauri::menu::{Menu, MenuItem};
+use tauri::image::Image;
+use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+use tauri::window::{Effect, EffectsBuilder};
 use tauri::{AppHandle, Emitter, Manager, RunEvent, State, WindowEvent};
 
 use engine::{Engine, Strategy, ZapretPaths};
@@ -25,6 +29,7 @@ use tgproxy::Proxy;
 use util::{run_quiet, Log};
 
 const ZAPRET_VERSION: &str = "обходы: Flowseal zapret-discord-youtube";
+/// Версия прокси, если сборка не положила рядом с ним version.txt.
 const TG_VERSION: &str = "tg-ws-proxy 1.11.1";
 const TASK_NAME: &str = "Prism";
 
@@ -34,6 +39,10 @@ const UPDATING: &str = "Обновляются обходы";
 const RESTARTING: &str = "Обход перезапускается";
 /// Сторож перезапускает упавший winws.exe не чаще стольких раз за 5 минут.
 const MAX_RESTARTS: usize = 3;
+/// Сколько своих сайтов проверяет подбор и сколько очков даёт каждый открывшийся.
+/// Discord и YouTube дают по 100, поэтому свои сайты решают спор, но не перевешивают их.
+const OWN_SITES: usize = 3;
+const OWN_SITE_SCORE: usize = 30;
 
 struct Inner {
     settings: Settings,
@@ -50,12 +59,17 @@ struct Prism {
     data: PathBuf,
     zapret: ZapretPaths,
     tg_exe: PathBuf,
+    tg_version: String,
     settings_file: PathBuf,
     hosts_cache: PathBuf,
     /// Последний итог проверки DNS для YouTube: в журнал пишем, только когда он меняется.
     dns_note: Mutex<&'static str>,
     /// Нажали «Стоп» во время подбора.
     cancel: AtomicBool,
+    /// Имя текущей сети (см. net.rs), пустое, пока не узнали или нет интернета.
+    network: Mutex<String>,
+    /// Windows 11: окно может быть полупрозрачным (Mica).
+    mica_ok: bool,
 }
 
 /// Движок занят: пока идёт подбор, обновление или перезапуск, другие команды
@@ -87,6 +101,10 @@ impl Prism {
         }
         i.busy = Some(what);
         Ok(Busy(self))
+    }
+
+    fn network(&self) -> String {
+        self.network.lock().unwrap().clone()
     }
 
     /// Записать в журнал итог проверки DNS. Проверка на главной идёт каждую минуту,
@@ -125,21 +143,28 @@ struct AppState {
     tray: bool,
     user_sites: Vec<String>,
     builtin_sites: usize,
-    versions: Vec<&'static str>,
+    versions: Vec<String>,
     auto_update: bool,
     app_version: &'static str,
     zapret_version: String,
     portable: bool,
+    /// Имя текущей сети и запомнена ли для неё выбранная стратегия.
+    network: String,
+    profile: bool,
+    mica: bool,
+    mica_ok: bool,
 }
 
 type R<T> = Result<T, String>;
 
 fn snapshot(p: &Prism) -> AppState {
+    let network = p.network();
     let mut i = p.inner.lock().unwrap();
     let engine_on = i.engine.alive();
     let since = i.engine.since_ms();
     let tg_on = i.proxy.alive();
     let s = &i.settings;
+    let profile = !network.is_empty() && s.profile(&network) == Some(s.strategy.as_str());
     AppState {
         engine_on,
         since,
@@ -153,11 +178,15 @@ fn snapshot(p: &Prism) -> AppState {
         tray: s.tray,
         user_sites: read_user_sites(&p.zapret),
         builtin_sites: count_lines(&p.zapret.lists().join("list-general.txt")),
-        versions: vec![ZAPRET_VERSION, TG_VERSION],
+        versions: vec![ZAPRET_VERSION.to_string(), p.tg_version.clone()],
         auto_update: s.auto_update,
         app_version: env!("CARGO_PKG_VERSION"),
         zapret_version: zapret_version(&p.zapret),
         portable: is_portable(),
+        network,
+        profile,
+        mica: s.mica,
+        mica_ok: p.mica_ok,
     }
 }
 
@@ -227,6 +256,57 @@ fn is_portable() -> bool {
         .ok()
         .and_then(|e| e.parent().map(|d| !d.join("uninstall.exe").exists()))
         .unwrap_or(true)
+}
+
+/// Версия прокси Telegram из version.txt, который кладёт сборка.
+fn tg_version(res: &Path) -> String {
+    std::fs::read_to_string(res.join("tgproxy").join("version.txt"))
+        .ok()
+        .map(|v| v.trim().trim_start_matches('v').to_string())
+        .filter(|v| !v.is_empty() && v.len() < 20)
+        .map(|v| format!("tg-ws-proxy {v}"))
+        .unwrap_or_else(|| TG_VERSION.to_string())
+}
+
+/// Номер сборки Windows (22000 и выше — Windows 11) из вывода `ver`.
+fn windows_build() -> u32 {
+    let out = util::hidden("cmd")
+        .args(["/C", "ver"])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default();
+    parse_build(&out)
+}
+
+/// «Microsoft Windows [Version 10.0.22631.4602]» → 22631. Слово «Version» в русской Windows
+/// переведено, поэтому ищем сами числа через точку.
+fn parse_build(s: &str) -> u32 {
+    s.split(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .find(|t| t.matches('.').count() >= 2)
+        .and_then(|t| t.split('.').nth(2))
+        .and_then(|b| b.parse().ok())
+        .unwrap_or(0)
+}
+
+/// Эффект Mica: сквозь фон окна чуть видны обои. Только Windows 11.
+fn apply_mica(app: &AppHandle, on: bool) {
+    if let Some(w) = app.get_webview_window("main") {
+        let fx = on.then(|| EffectsBuilder::new().effect(Effect::Mica).build());
+        let _ = w.set_effects(fx);
+    }
+}
+
+/// Серая и чуть прозрачная копия значка: так в трее видно, что обход выключен.
+fn gray(rgba: &[u8]) -> Vec<u8> {
+    let mut px = rgba.to_vec();
+    for c in px.chunks_exact_mut(4) {
+        let y = ((c[0] as u32 * 299 + c[1] as u32 * 587 + c[2] as u32 * 114) / 1000) as u8;
+        c[0] = y;
+        c[1] = y;
+        c[2] = y;
+        c[3] = (c[3] as u32 * 11 / 20) as u8;
+    }
+    px
 }
 
 fn open_url(url: &str) {
@@ -359,6 +439,20 @@ async fn set_auto_update(p: State<'_, Prism>, on: bool) -> R<AppState> {
 }
 
 #[tauri::command]
+async fn set_mica(app: AppHandle, p: State<'_, Prism>, on: bool) -> R<AppState> {
+    if !p.mica_ok {
+        return Err("Прозрачный фон работает только в Windows 11".into());
+    }
+    {
+        let mut i = p.inner.lock().unwrap();
+        i.settings.mica = on;
+        p.save(&i);
+    }
+    apply_mica(&app, on);
+    Ok(snapshot(&p))
+}
+
+#[tauri::command]
 async fn get_state(p: State<'_, Prism>) -> R<AppState> {
     Ok(snapshot(&p))
 }
@@ -379,14 +473,17 @@ async fn set_engine(p: State<'_, Prism>, on: bool) -> R<AppState> {
     Ok(snapshot(&p))
 }
 
+/// Ручной выбор стратегии запоминается для текущей сети, как и итог подбора.
 #[tauri::command]
 async fn set_strategy(p: State<'_, Prism>, id: String) -> R<AppState> {
     if !engine::list_strategies(&p.zapret).iter().any(|s| s.id == id) {
         return Err("Такой стратегии нет".into());
     }
+    let net = p.network();
     let _busy = p.begin(RESTARTING)?;
     let running = {
         let mut i = p.inner.lock().unwrap();
+        i.settings.remember(&net, &id);
         i.settings.strategy = id;
         p.save(&i);
         i.engine.alive()
@@ -538,7 +635,7 @@ async fn check_services(p: State<'_, Prism>) -> R<Status> {
     };
     let (s, d) = tokio::join!(probe::services(6, &dns), dns_check);
     let telegram = probe::tcp(port).await;
-    let chatgpt = ai && std::fs::read_to_string(hosts::hosts_path()).map(|t| t.contains("Prism: нейросети")).unwrap_or(false);
+    let chatgpt = ai && hosts::present();
     let youtube_dns = d
         .map(|d| {
             p.note_dns(&d, false);
@@ -555,12 +652,24 @@ struct Progress {
     ms: u64,
 }
 
+/// Свои сайты из раздела «Сайты»: сколько из первых нескольких открылось.
+/// Их добавляют как раз потому, что они не открываются, так что подбор их учитывает.
+async fn own_sites(sites: &[String]) -> probe::Check {
+    if sites.is_empty() {
+        return probe::Check::default();
+    }
+    let owned: Vec<(String, String)> = sites.iter().take(OWN_SITES).map(|d| (d.clone(), format!("https://{d}/"))).collect();
+    let urls: Vec<(&str, &str)> = owned.iter().map(|(n, u)| (n.as_str(), u.as_str())).collect();
+    probe::any(&probe::client(4), &urls).await
+}
+
 #[tauri::command]
 async fn auto_pick(app: AppHandle, p: State<'_, Prism>) -> R<AppState> {
     let _busy = p.begin(PICKING)?;
     p.cancel.store(false, Ordering::SeqCst);
     let stopped = || p.cancel.load(Ordering::SeqCst);
     let list = engine::list_strategies(&p.zapret);
+    let user = read_user_sites(&p.zapret);
     let (previous, was_on) = {
         let i = p.inner.lock().unwrap();
         (i.settings.strategy.clone(), i.settings.engine_on)
@@ -573,6 +682,10 @@ async fn auto_pick(app: AppHandle, p: State<'_, Prism>) -> R<AppState> {
     } else {
         "[prism] YouTube проверяется по адресам от безопасного DNS (Google, Cloudflare)"
     });
+    if !user.is_empty() {
+        let names: Vec<&str> = user.iter().take(OWN_SITES).map(String::as_str).collect();
+        p.log.push(format!("[prism] подбор проверяет и свои сайты: {}", names.join(", ")));
+    }
     let mut best: Option<(usize, u64, String)> = None;
     for s in &list {
         if stopped() {
@@ -586,28 +699,29 @@ async fn auto_pick(app: AppHandle, p: State<'_, Prism>) -> R<AppState> {
         }
         // Оценка важнее «работает/не работает»: для YouTube считаем, сколько адресов
         // ответило из проверенных. Стратегия, где открывается сайт, но не видео, хуже.
-        let (score, ms, failed_yt) = if started {
-            let mut r = probe::services(4, &dns).await;
+        let (score, ms, failed_yt, own_note) = if started {
+            let (mut r, mut own) = tokio::join!(probe::services(4, &dns), own_sites(&user));
             // Сразу после перезапуска движка часть соединений ещё не поднялась.
             // Нулевой результат повторяем один раз, чтобы не отбросить рабочую стратегию.
             if !r.discord.ok && !r.youtube.ok && !stopped() {
                 tokio::time::sleep(Duration::from_millis(900)).await;
-                r = probe::services(4, &dns).await;
+                (r, own) = tokio::join!(probe::services(4, &dns), own_sites(&user));
             }
             let svc = [&r.discord, &r.youtube];
             let ok = svc.iter().filter(|x| x.ok).count();
             let adr = svc.iter().map(|x| x.good as usize).sum::<usize>();
             let ms = if ok > 0 { (r.discord.ms + r.youtube.ms) / ok as u64 } else { 0 };
+            let note = if own.total > 0 { format!(", свои сайты: {} из {}", own.good, own.total) } else { String::new() };
             // Что именно не открылось и почему: сайт, видеосервер или api.
             // Причины собраны в той же проверке, перепроверять YouTube не нужно.
-            (ok * 100 + adr, ms, r.youtube.failed.join(", "))
+            (ok * 100 + adr + own.good as usize * OWN_SITE_SCORE, ms, r.youtube.failed.join(", "), note)
         } else {
-            (0, 0, String::new())
+            (0, 0, String::new(), String::new())
         };
         let state = if score >= 200 { "ok" } else if score > 0 { "part" } else { "bad" };
         let _ = app.emit("pick-progress", Progress { id: s.id.clone(), state, ms });
         p.log.push(format!(
-            "[prism] {}: оценка {score}, {ms} мс{}",
+            "[prism] {}: оценка {score}, {ms} мс{own_note}{}",
             s.name,
             if failed_yt.is_empty() { String::new() } else { format!(", YouTube не открылся: {failed_yt}") }
         ));
@@ -622,6 +736,7 @@ async fn auto_pick(app: AppHandle, p: State<'_, Prism>) -> R<AppState> {
     // «Стоп» берёт лучшую из уже проверенных. Если рабочей не нашлось,
     // возвращаем прежнюю стратегию и прежнее состояние обхода.
     let cancelled = stopped();
+    let found = best.is_some();
     let (chosen, on) = match best {
         Some(b) => (b.2, true),
         None if cancelled => (previous, was_on),
@@ -630,11 +745,19 @@ async fn auto_pick(app: AppHandle, p: State<'_, Prism>) -> R<AppState> {
     if cancelled {
         p.log.push("[prism] подбор остановлен");
     }
+    // Найденная стратегия запоминается для текущей сети.
+    let net = p.network();
     {
         let mut i = p.inner.lock().unwrap();
+        if found {
+            i.settings.remember(&net, &chosen);
+        }
         i.settings.strategy = chosen;
         i.settings.engine_on = on;
         p.save(&i);
+    }
+    if found && !net.is_empty() {
+        p.log.push(format!("[prism] стратегия запомнена для сети «{net}»"));
     }
     if on {
         start_engine(&p).await?;
@@ -653,6 +776,81 @@ async fn auto_pick(app: AppHandle, p: State<'_, Prism>) -> R<AppState> {
 async fn stop_pick(p: State<'_, Prism>) -> R<()> {
     p.cancel.store(true, Ordering::SeqCst);
     Ok(())
+}
+
+/// Сеть поменялась: включить стратегию, которая в этой сети уже работала.
+async fn apply_profile(app: AppHandle) {
+    let p = app.state::<Prism>();
+    let _ = app.emit("state-changed", ());
+    let net = p.network();
+    let Some(want) = p.inner.lock().unwrap().settings.profile(&net).map(str::to_string) else { return };
+    let Some(strategy) = engine::list_strategies(&p.zapret).into_iter().find(|s| s.id == want) else { return };
+    // Движок может быть занят: при запуске Prism как раз включает обход. Ждём до минуты.
+    let mut tries = 0;
+    let busy = loop {
+        match p.begin(RESTARTING) {
+            Ok(b) => break b,
+            Err(_) if tries < 20 => {
+                tries += 1;
+                tokio::time::sleep(Duration::from_secs(3)).await;
+            }
+            Err(_) => return,
+        }
+    };
+    // Пока ждали, сеть могла смениться ещё раз.
+    if p.network() != net {
+        return;
+    }
+    let (same, running) = {
+        let mut i = p.inner.lock().unwrap();
+        let same = i.settings.strategy == want;
+        if !same {
+            i.settings.strategy = want.clone();
+            p.save(&i);
+        }
+        (same, i.engine.alive())
+    };
+    if same {
+        return;
+    }
+    p.log.push(format!("[prism] сеть «{net}»: включаю стратегию «{}» из профиля сети", strategy.name));
+    if running {
+        if let Err(e) = start_engine(&p).await {
+            p.log.push(format!("[prism] {e}"));
+        }
+    }
+    drop(busy);
+    let _ = app.emit("notice", format!("Сеть «{net}»: включена стратегия «{}»", strategy.name));
+    let _ = app.emit("state-changed", ());
+}
+
+/// Включить или выключить обход из меню значка в трее.
+async fn tray_toggle(app: AppHandle) {
+    let p = app.state::<Prism>();
+    let busy = match p.begin(RESTARTING) {
+        Ok(b) => b,
+        Err(e) => {
+            let _ = app.emit("notice", e);
+            return;
+        }
+    };
+    let on = !p.inner.lock().unwrap().engine.alive();
+    let r = if on {
+        start_engine(&p).await
+    } else {
+        stop_engine(&p);
+        Ok(())
+    };
+    match r {
+        Ok(()) => {
+            let mut i = p.inner.lock().unwrap();
+            i.settings.engine_on = on;
+            p.save(&i);
+        }
+        Err(e) => p.log.push(format!("[prism] {e}")),
+    }
+    drop(busy);
+    let _ = app.emit("state-changed", ());
 }
 
 fn xml_escape(s: &str) -> String {
@@ -857,7 +1055,7 @@ async fn watchdog(app: AppHandle) {
             drop(busy);
             let text = "Обход выключен: winws.exe падает снова и снова. Нажмите «Подобрать» или выберите другую стратегию";
             p.log.push(format!("[prism] winws.exe завершился ({code}) {MAX_RESTARTS} раза за 5 минут. {text}"));
-            let _ = app.emit("engine-crashed", text);
+            let _ = app.emit("notice", text);
             let _ = app.emit("state-changed", ());
             continue;
         }
@@ -875,6 +1073,36 @@ async fn watchdog(app: AppHandle) {
         }
         drop(busy);
         let _ = app.emit("state-changed", ());
+    }
+}
+
+/// Следить за сетью в отдельном потоке: Windows будит его, когда меняются IP-адреса.
+/// Имя сети узнаём только после такой перемены, а не по таймеру.
+fn watch_network(app: AppHandle) {
+    let mut first = true;
+    loop {
+        if !first {
+            if !net::wait_change() {
+                std::thread::sleep(Duration::from_secs(60));
+            }
+            // Адреса меняются пачкой (IPv4, IPv6, DNS): ждём, пока сеть устоится.
+            std::thread::sleep(Duration::from_secs(4));
+        }
+        first = false;
+        let name = net::current().unwrap_or_default();
+        let p = app.state::<Prism>();
+        let changed = {
+            let mut cur = p.network.lock().unwrap();
+            let changed = *cur != name;
+            *cur = name.clone();
+            changed
+        };
+        if changed {
+            if !name.is_empty() {
+                p.log.push(format!("[prism] сеть: «{name}»"));
+            }
+            tauri::async_runtime::spawn(apply_profile(app.clone()));
+        }
     }
 }
 
@@ -956,30 +1184,53 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     settings.save(&settings_file);
     let restore = (settings.engine_on, settings.tg_on);
     let keep_task = settings.autostart;
+    let mica_ok = windows_build() >= 22000;
+    let mica = mica_ok && settings.mica;
 
     app.manage(Prism {
         inner: Mutex::new(Inner { settings, engine: Engine::default(), proxy: Proxy::default(), busy: None }),
         log,
         zapret,
         tg_exe: res.join("tgproxy").join("tg-ws-proxy.exe"),
+        tg_version: tg_version(&res),
         settings_file,
         hosts_cache: data.join("ai-hosts.txt"),
         data,
         dns_note: Mutex::new(""),
         cancel: AtomicBool::new(false),
+        network: Mutex::new(String::new()),
+        mica_ok,
     });
 
-    // Трей
+    if mica {
+        apply_mica(app.handle(), true);
+    }
+
+    // Трей: быстрые действия без окна. Значок серый, пока обход выключен.
+    let base = app.default_window_icon().ok_or("no icon")?;
+    let (w, h) = (base.width(), base.height());
+    let icon_on = Image::new_owned(base.rgba().to_vec(), w, h);
+    let icon_off = Image::new_owned(gray(base.rgba()), w, h);
     let show = MenuItem::with_id(app, "show", "Открыть Prism", true, None::<&str>)?;
+    let toggle = MenuItem::with_id(app, "toggle", "Включить обход", true, None::<&str>)?;
+    let pick = MenuItem::with_id(app, "pick", "Подобрать стратегию", true, None::<&str>)?;
+    let sep = PredefinedMenuItem::separator(app)?;
     let quit = MenuItem::with_id(app, "quit", "Выйти", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&show, &quit])?;
+    let menu = Menu::with_items(app, &[&show, &toggle, &pick, &sep, &quit])?;
     TrayIconBuilder::with_id("main")
-        .icon(app.default_window_icon().cloned().ok_or("no icon")?)
+        .icon(icon_off.clone())
         .tooltip("Prism")
         .menu(&menu)
         .show_menu_on_left_click(false)
         .on_menu_event(|app, e| match e.id.as_ref() {
             "show" => show_main(app),
+            "toggle" => {
+                tauri::async_runtime::spawn(tray_toggle(app.clone()));
+            }
+            "pick" => {
+                show_main(app);
+                let _ = app.emit("tray-pick", ());
+            }
             "quit" => {
                 shutdown(app);
                 app.exit(0);
@@ -997,7 +1248,7 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         show_main(app.handle());
     }
 
-    // Подсказка у значка в трее: видно, включён ли обход, даже когда окно скрыто.
+    // Значок, подсказка и пункт меню в трее следят за обходом, даже когда окно скрыто.
     let tip = app.handle().clone();
     tauri::async_runtime::spawn(async move {
         let mut last: Option<bool> = None;
@@ -1006,6 +1257,8 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
             if last != Some(on) {
                 if let Some(t) = tip.tray_by_id("main") {
                     let text = if on { "Prism: обход включён" } else { "Prism: обход выключен" };
+                    let _ = t.set_icon(Some(if on { icon_on.clone() } else { icon_off.clone() }));
+                    let _ = toggle.set_text(if on { "Выключить обход" } else { "Включить обход" });
                     if t.set_tooltip(Some(text)).is_ok() {
                         last = Some(on);
                     }
@@ -1016,6 +1269,8 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     });
 
     tauri::async_runtime::spawn(watchdog(app.handle().clone()));
+    let net_app = app.handle().clone();
+    std::thread::spawn(move || watch_network(net_app));
 
     // Вернуть то, что было включено в прошлый раз.
     let handle = app.handle().clone();
@@ -1033,6 +1288,19 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
             let (port, secret) = (i.settings.tg_port, i.settings.tg_secret.clone());
             if let Err(e) = i.proxy.start(&p.tg_exe, port, &secret, &p.log) {
                 p.log.push(format!("[prism] {e}"));
+            }
+        }
+        // Блок адресов нейросетей мог пропасть из hosts: его убирает деинсталлятор
+        // при переустановке, а иногда антивирус. Возвращаем его из сохранённой копии.
+        let ai = p.inner.lock().unwrap().settings.ai;
+        if ai && !hosts::present() {
+            let restored = match std::fs::read_to_string(&p.hosts_cache) {
+                Ok(list) => hosts::enable(&list),
+                Err(_) => refresh_ai_hosts(&p).await,
+            };
+            match restored {
+                Ok(()) => p.log.push("[prism] адреса нейросетей снова записаны в hosts"),
+                Err(e) => p.log.push(format!("[prism] {e}")),
             }
         }
         let _ = handle.emit("state-changed", ());
@@ -1083,6 +1351,15 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn main() {
+    // Деинсталлятор: убрать то, что Prism менял в Windows, и выйти, не открывая окно.
+    // Проверяем до запуска Tauri: иначе плагин одного экземпляра просто показал бы
+    // уже открытый Prism, и уборка не случилась бы.
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--cleanup") {
+        cleanup::run(args.iter().any(|a| a == "--purge"));
+        return;
+    }
+
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| show_main(app)))
         .setup(|app| {
@@ -1103,7 +1380,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             get_state, set_engine, set_strategy, set_games, set_ai, set_tg, open_tg_link,
             add_site, remove_site, check_services, auto_pick, stop_pick, set_autostart, set_tray, get_log, close_window,
-            check_updates, update_zapret, update_app, set_auto_update
+            check_updates, update_zapret, update_app, set_auto_update, set_mica
         ])
         .build(tauri::generate_context!())
         .unwrap_or_else(|e| fatal(&format!("{e}. Возможно, не установлен Microsoft Edge WebView2.")));
@@ -1127,5 +1404,18 @@ mod tests {
         assert!(!list_line("# Never leave this file empty"));
         assert!(!list_line("--debug=@C:\\x"));
         assert!(!list_line(""));
+    }
+
+    #[test]
+    fn reads_windows_build() {
+        assert_eq!(parse_build("\r\nMicrosoft Windows [Version 10.0.22631.4602]\r\n"), 22631);
+        assert_eq!(parse_build("Microsoft Windows [Версия 10.0.19045.3803]"), 19045);
+        assert_eq!(parse_build(""), 0);
+        assert!(windows_build() > 0);
+    }
+
+    #[test]
+    fn grays_icon() {
+        assert_eq!(gray(&[255, 0, 0, 255, 10, 20, 30, 0]), vec![76, 76, 76, 140, 18, 18, 18, 0]);
     }
 }
