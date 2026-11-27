@@ -12,7 +12,7 @@ mod updates;
 mod util;
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -66,8 +66,13 @@ struct Prism {
     dns_note: Mutex<&'static str>,
     /// Нажали «Стоп» во время подбора.
     cancel: AtomicBool,
-    /// Имя текущей сети (см. net.rs), пустое, пока не узнали или нет интернета.
+    /// Имя текущей сети (см. net.rs), пустое, пока не узнали или нет сети.
     network: Mutex<String>,
+    /// Номер перемены сети. Подбор и профили сверяются с ним, чтобы результат,
+    /// полученный в одной сети, не попал в профиль другой.
+    net_gen: AtomicU64,
+    /// Запись в hosts и флажок «Нейросети» меняются вместе, под этим замком.
+    hosts_lock: Mutex<()>,
     /// Windows 11: окно может быть полупрозрачным (Mica).
     mica_ok: bool,
 }
@@ -101,6 +106,17 @@ impl Prism {
         }
         i.busy = Some(what);
         Ok(Busy(self))
+    }
+
+    /// Занять движок, дождавшись, пока он освободится. Для запуска Prism: обход
+    /// нужно включить в любом случае, даже если первым движок занял профиль сети.
+    async fn wait_begin(&self, what: &'static str) -> Busy<'_> {
+        loop {
+            if let Ok(b) = self.begin(what) {
+                return b;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
     }
 
     fn network(&self) -> String {
@@ -381,12 +397,26 @@ async fn do_update_zapret(p: &Prism) -> R<bool> {
     Ok(true)
 }
 
-async fn refresh_ai_hosts(p: &Prism) -> R<()> {
+/// Записать адреса нейросетей, если доступ к ним всё ещё включён. Проверка флажка
+/// и запись идут под одним замком с set_ai: иначе скачивание, закончившееся уже
+/// после выключения, вернуло бы блок в hosts. Возвращает, записан ли блок.
+fn apply_ai_hosts(p: &Prism, list: &str) -> R<bool> {
+    let _g = p.hosts_lock.lock().unwrap();
+    if !p.inner.lock().unwrap().settings.ai {
+        return Ok(false);
+    }
+    hosts::enable(list)?;
+    Ok(true)
+}
+
+async fn refresh_ai_hosts(p: &Prism) -> R<bool> {
     let list = hosts::download().await?;
     let _ = std::fs::write(&p.hosts_cache, &list);
-    hosts::enable(&list)?;
-    p.log.push("[prism] список адресов для нейросетей обновлён");
-    Ok(())
+    let written = apply_ai_hosts(p, &list)?;
+    if written {
+        p.log.push("[prism] список адресов для нейросетей обновлён");
+    }
+    Ok(written)
 }
 
 #[tauri::command]
@@ -511,19 +541,24 @@ async fn set_games(p: State<'_, Prism>, on: bool) -> R<AppState> {
 
 #[tauri::command]
 async fn set_ai(p: State<'_, Prism>, on: bool) -> R<AppState> {
-    if on {
-        let list = match hosts::download().await {
+    let list = if on {
+        Some(match hosts::download().await {
             Ok(l) => {
                 let _ = std::fs::write(&p.hosts_cache, &l);
                 l
             }
             Err(e) => std::fs::read_to_string(&p.hosts_cache).map_err(|_| e)?,
-        };
-        hosts::enable(&list)?;
+        })
     } else {
-        hosts::disable()?;
-    }
+        None
+    };
     {
+        // Запись в hosts и флажок меняются вместе: см. apply_ai_hosts.
+        let _g = p.hosts_lock.lock().unwrap();
+        match &list {
+            Some(l) => hosts::enable(l)?,
+            None => hosts::disable()?,
+        }
         let mut i = p.inner.lock().unwrap();
         i.settings.ai = on;
         p.save(&i);
@@ -668,6 +703,8 @@ async fn auto_pick(app: AppHandle, p: State<'_, Prism>) -> R<AppState> {
     let _busy = p.begin(PICKING)?;
     p.cancel.store(false, Ordering::SeqCst);
     let stopped = || p.cancel.load(Ordering::SeqCst);
+    // Номер сети, в которой идёт подбор: см. конец функции.
+    let gen = p.net_gen.load(Ordering::SeqCst);
     let list = engine::list_strategies(&p.zapret);
     let user = read_user_sites(&p.zapret);
     let (previous, was_on) = {
@@ -745,19 +782,24 @@ async fn auto_pick(app: AppHandle, p: State<'_, Prism>) -> R<AppState> {
     if cancelled {
         p.log.push("[prism] подбор остановлен");
     }
-    // Найденная стратегия запоминается для текущей сети.
+    // Найденная стратегия запоминается для сети, в которой её проверяли. Если сеть
+    // за время подбора сменилась, результат смешанный, и профили не трогаем.
     let net = p.network();
+    let same_net = p.net_gen.load(Ordering::SeqCst) == gen;
+    let keep = found && same_net && !net.is_empty();
     {
         let mut i = p.inner.lock().unwrap();
-        if found {
+        if keep {
             i.settings.remember(&net, &chosen);
         }
         i.settings.strategy = chosen;
         i.settings.engine_on = on;
         p.save(&i);
     }
-    if found && !net.is_empty() {
+    if keep {
         p.log.push(format!("[prism] стратегия запомнена для сети «{net}»"));
+    } else if found && !same_net {
+        p.log.push("[prism] сеть сменилась во время подбора, стратегия для сети не запомнена");
     }
     if on {
         start_engine(&p).await?;
@@ -779,28 +821,35 @@ async fn stop_pick(p: State<'_, Prism>) -> R<()> {
 }
 
 /// Сеть поменялась: включить стратегию, которая в этой сети уже работала.
-async fn apply_profile(app: AppHandle) {
+/// `gen` — номер перемены сети. Если сеть успела смениться ещё раз, этот вызов
+/// ничего не делает: профилем займётся вызов для новой сети.
+async fn apply_profile(app: AppHandle, gen: u64) {
     let p = app.state::<Prism>();
     let _ = app.emit("state-changed", ());
+    let stale = || p.net_gen.load(Ordering::SeqCst) != gen;
     let net = p.network();
-    let Some(want) = p.inner.lock().unwrap().settings.profile(&net).map(str::to_string) else { return };
-    let Some(strategy) = engine::list_strategies(&p.zapret).into_iter().find(|s| s.id == want) else { return };
-    // Движок может быть занят: при запуске Prism как раз включает обход. Ждём до минуты.
-    let mut tries = 0;
-    let busy = loop {
-        match p.begin(RESTARTING) {
-            Ok(b) => break b,
-            Err(_) if tries < 20 => {
-                tries += 1;
-                tokio::time::sleep(Duration::from_secs(3)).await;
-            }
-            Err(_) => return,
-        }
-    };
-    // Пока ждали, сеть могла смениться ещё раз.
-    if p.network() != net {
+    // Профиля для этой сети нет: и ждать нечего.
+    if p.inner.lock().unwrap().settings.profile(&net).is_none() {
         return;
     }
+    // Движок может быть занят подбором, обновлением или запуском Prism: ждём,
+    // сколько нужно. После новой перемены сети ждать незачем.
+    let busy = loop {
+        if stale() {
+            return;
+        }
+        match p.begin(RESTARTING) {
+            Ok(b) => break b,
+            Err(_) => tokio::time::sleep(Duration::from_secs(3)).await,
+        }
+    };
+    if stale() {
+        return;
+    }
+    // Профиль читаем заново: пока ждали, подбор мог запомнить для этой сети другую.
+    let want = p.inner.lock().unwrap().settings.profile(&net).map(str::to_string);
+    let Some(want) = want else { return };
+    let Some(strategy) = engine::list_strategies(&p.zapret).into_iter().find(|s| s.id == want) else { return };
     let (same, running) = {
         let mut i = p.inner.lock().unwrap();
         let same = i.settings.strategy == want;
@@ -813,14 +862,17 @@ async fn apply_profile(app: AppHandle) {
     if same {
         return;
     }
-    p.log.push(format!("[prism] сеть «{net}»: включаю стратегию «{}» из профиля сети", strategy.name));
-    if running {
-        if let Err(e) = start_engine(&p).await {
-            p.log.push(format!("[prism] {e}"));
-        }
-    }
+    p.log.push(format!("[prism] сеть «{net}»: стратегия «{}» из профиля сети", strategy.name));
+    let text = if !running {
+        format!("Сеть «{net}»: выбрана стратегия «{}»", strategy.name)
+    } else if let Err(e) = start_engine(&p).await {
+        p.log.push(format!("[prism] {e}"));
+        format!("Сеть «{net}»: стратегия «{}» не запустилась, подробности в журнале", strategy.name)
+    } else {
+        format!("Сеть «{net}»: включена стратегия «{}»", strategy.name)
+    };
     drop(busy);
-    let _ = app.emit("notice", format!("Сеть «{net}»: включена стратегия «{}»", strategy.name));
+    let _ = app.emit("notice", text);
     let _ = app.emit("state-changed", ());
 }
 
@@ -1076,32 +1128,46 @@ async fn watchdog(app: AppHandle) {
     }
 }
 
-/// Следить за сетью в отдельном потоке: Windows будит его, когда меняются IP-адреса.
-/// Имя сети узнаём только после такой перемены, а не по таймеру.
+/// Следить за сетью в отдельном потоке. Имя сети узнаётся после каждой перемены
+/// адресов и ещё трижды с паузой в 10 секунд: Windows не сразу опознаёт новую сеть.
+/// Без перемен сеть проверяется раз в 3 минуты: так видны и перемены только в IPv6.
 fn watch_network(app: AppHandle) {
-    let mut first = true;
+    let changes = net::changes();
+    // При запуске вместе с Windows сеть часто ещё не опознана.
+    let mut quick = 3;
     loop {
-        if !first {
-            if !net::wait_change() {
-                std::thread::sleep(Duration::from_secs(60));
-            }
-            // Адреса меняются пачкой (IPv4, IPv6, DNS): ждём, пока сеть устоится.
-            std::thread::sleep(Duration::from_secs(4));
-        }
-        first = false;
         let name = net::current().unwrap_or_default();
         let p = app.state::<Prism>();
-        let changed = {
+        let gen = {
             let mut cur = p.network.lock().unwrap();
-            let changed = *cur != name;
-            *cur = name.clone();
-            changed
+            if *cur == name {
+                None
+            } else {
+                *cur = name.clone();
+                Some(p.net_gen.fetch_add(1, Ordering::SeqCst) + 1)
+            }
         };
-        if changed {
+        if let Some(gen) = gen {
             if !name.is_empty() {
                 p.log.push(format!("[prism] сеть: «{name}»"));
             }
-            tauri::async_runtime::spawn(apply_profile(app.clone()));
+            tauri::async_runtime::spawn(apply_profile(app.clone(), gen));
+        }
+        let wait = if quick > 0 {
+            quick -= 1;
+            Duration::from_secs(10)
+        } else {
+            Duration::from_secs(180)
+        };
+        match changes.recv_timeout(wait) {
+            Ok(()) => {
+                // Адреса меняются пачкой (IPv4, IPv6, DNS): ждём, пока сеть устоится.
+                std::thread::sleep(Duration::from_secs(4));
+                while changes.try_recv().is_ok() {}
+                quick = 3;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => std::thread::sleep(wait),
         }
     }
 }
@@ -1199,6 +1265,8 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         dns_note: Mutex::new(""),
         cancel: AtomicBool::new(false),
         network: Mutex::new(String::new()),
+        net_gen: AtomicU64::new(0),
+        hosts_lock: Mutex::new(()),
         mica_ok,
     });
 
@@ -1277,7 +1345,11 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     tauri::async_runtime::spawn(async move {
         let p = handle.state::<Prism>();
         if restore.0 {
-            if let Ok(_busy) = p.begin(RESTARTING) {
+            // Ждём движок, а не пропускаем запуск: профиль сети мог занять его первым
+            // и только выбрать стратегию, ведь обход ещё не работал.
+            let _busy = p.wait_begin(RESTARTING).await;
+            let running = p.inner.lock().unwrap().engine.alive();
+            if !running {
                 if let Err(e) = start_engine(&p).await {
                     p.log.push(format!("[prism] {e}"));
                 }
@@ -1294,13 +1366,17 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         // при переустановке, а иногда антивирус. Возвращаем его из сохранённой копии.
         let ai = p.inner.lock().unwrap().settings.ai;
         if ai && !hosts::present() {
-            let restored = match std::fs::read_to_string(&p.hosts_cache) {
-                Ok(list) => hosts::enable(&list),
-                Err(_) => refresh_ai_hosts(&p).await,
-            };
-            match restored {
-                Ok(()) => p.log.push("[prism] адреса нейросетей снова записаны в hosts"),
-                Err(e) => p.log.push(format!("[prism] {e}")),
+            match std::fs::read_to_string(&p.hosts_cache) {
+                Ok(list) => match apply_ai_hosts(&p, &list) {
+                    Ok(true) => p.log.push("[prism] адреса нейросетей снова записаны в hosts"),
+                    Ok(false) => {}
+                    Err(e) => p.log.push(format!("[prism] {e}")),
+                },
+                Err(_) => {
+                    if let Err(e) = refresh_ai_hosts(&p).await {
+                        p.log.push(format!("[prism] {e}"));
+                    }
+                }
             }
         }
         let _ = handle.emit("state-changed", ());
@@ -1353,11 +1429,12 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
 fn main() {
     // Деинсталлятор: убрать то, что Prism менял в Windows, и выйти, не открывая окно.
     // Проверяем до запуска Tauri: иначе плагин одного экземпляра просто показал бы
-    // уже открытый Prism, и уборка не случилась бы.
+    // уже открытый Prism, и уборка не случилась бы. Код выхода 2: убрать удалось не всё.
     let args: Vec<String> = std::env::args().collect();
-    if args.iter().any(|a| a == "--cleanup") {
-        cleanup::run(args.iter().any(|a| a == "--purge"));
-        return;
+    let flag = |f: &str| args.iter().any(|a| a == f);
+    if flag("--cleanup") {
+        let ok = cleanup::run(flag("--purge"), flag("--quiet"));
+        std::process::exit(if ok { 0 } else { 2 });
     }
 
     let app = tauri::Builder::default()
