@@ -15,6 +15,12 @@ pub fn hosts_path() -> PathBuf {
     crate::secure::system_dir().join("drivers").join("etc").join("hosts")
 }
 
+/// Есть ли в hosts блок Prism. Его мог убрать деинсталлятор при переустановке
+/// или антивирус, тогда Prism записывает его заново.
+pub fn present() -> bool {
+    fs::read_to_string(hosts_path()).map(|t| t.contains(START)).unwrap_or(false)
+}
+
 /// Оставить из списка только нужные разделы и строки «IP домен».
 pub fn filter_list(raw: &str) -> String {
     let mut out = Vec::new();
