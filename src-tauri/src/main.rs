@@ -821,14 +821,25 @@ fn shutdown(app: &AppHandle) {
 async fn watchdog(app: AppHandle) {
     let p = app.state::<Prism>();
     let mut restarts: Vec<Instant> = Vec::new();
+    // Прошлый перезапуск не удался: процесса движка нет, а обход должен работать.
+    // Без этого флажка сторож больше не замечал бы поломку: exited() без процесса молчит.
+    let mut pending = false;
     loop {
         tokio::time::sleep(Duration::from_secs(5)).await;
         let code = {
             let mut i = p.inner.lock().unwrap();
-            if i.busy.is_some() || !i.settings.engine_on {
+            if i.busy.is_some() {
                 None
+            } else if !i.settings.engine_on {
+                pending = false;
+                None
+            } else if let Some(c) = i.engine.exited() {
+                Some(c)
+            } else if pending && !i.engine.alive() {
+                Some("прошлый перезапуск не удался".to_string())
             } else {
-                i.engine.exited()
+                pending = false;
+                None
             }
         };
         let Some(code) = code else { continue };
@@ -842,6 +853,7 @@ async fn watchdog(app: AppHandle) {
                 p.save(&i);
             }
             restarts.clear();
+            pending = false;
             drop(busy);
             let text = "Обход выключен: winws.exe падает снова и снова. Нажмите «Подобрать» или выберите другую стратегию";
             p.log.push(format!("[prism] winws.exe завершился ({code}) {MAX_RESTARTS} раза за 5 минут. {text}"));
@@ -852,8 +864,14 @@ async fn watchdog(app: AppHandle) {
         restarts.push(Instant::now());
         p.log.push(format!("[prism] winws.exe неожиданно завершился ({code}), перезапускаю"));
         match start_engine(&p).await {
-            Ok(()) => p.log.push("[prism] обход снова работает"),
-            Err(e) => p.log.push(format!("[prism] {e}")),
+            Ok(()) => {
+                pending = false;
+                p.log.push("[prism] обход снова работает");
+            }
+            Err(e) => {
+                pending = true;
+                p.log.push(format!("[prism] {e}"));
+            }
         }
         drop(busy);
         let _ = app.emit("state-changed", ());
@@ -1019,7 +1037,7 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         }
         let _ = handle.emit("state-changed", ());
 
-        // Обновить задание автозапуска: путь к программ�� мог измениться,
+        // Обновить задание автозапуска: путь к программе мог измениться,
         // а задания из старых версий не запускались от батареи.
         // Портативным копиям старые версии тоже ставили задание, такое задание убираем.
         if keep_task {
