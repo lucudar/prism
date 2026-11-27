@@ -7,7 +7,7 @@ const mock = (() => {
   const st = { engine_on:false, strategy:'general.bat', games:false, ai:false, tg_on:false, autostart:false, tray:true,
     tg:{host:'127.0.0.1',port:1443,secret:'7f3a9c41e0b25d88f6c1a04e93b7d2aa',link:'tg://proxy?server=127.0.0.1&port=1443&secret=dd7f3a9c41e0b25d88f6c1a04e93b7d2aa'},
     strategies:[['general.bat','Основная','Рекомендуемая, начните с неё'],['general (ALT).bat','ALT','Альтернативная разрезка пакетов'],['general (ALT2).bat','ALT2','Альтернативная разрезка пакетов'],['general (FAKE TLS AUTO).bat','FAKE TLS AUTO','Поддельное TLS-приветствие, часто помогает на мобильном интернете'],['general (SIMPLE FAKE).bat','SIMPLE FAKE','Простые фейковые пакеты']].map(([id,name,desc])=>({id,name,desc})),
-    since:0, user_sites:['rutracker.org','nnmclub.to'], builtin_sites:142, auto_update:true, app_version:'0.14.0', zapret_version:'1.10.4', portable:false, versions:['zapret-discord-youtube 1.10.4 (winws из zapret v72.9)','tg-ws-proxy 1.11.1'],
+    since:0, user_sites:['rutracker.org','nnmclub.to'], builtin_sites:142, auto_update:true, app_version:'0.14.1', zapret_version:'1.10.4', portable:false, versions:['zapret-discord-youtube 1.10.4 (winws из zapret v72.9)','tg-ws-proxy 1.11.1'],
     network:'Home-WiFi', profile:true, mica:false, mica_ok:false };
   const wait = ms => new Promise(r => setTimeout(r, ms));
   let stopFlag = false;
@@ -32,7 +32,7 @@ const mock = (() => {
       case 'stop_pick': stopFlag = true; return null;
       case 'get_log': return '[prism] предпросмотр в браузере';
       case 'set_auto_update': st.auto_update = a.on; break;
-      case 'check_updates': return { app:{current:'0.14.0',latest:'0.14.1',available:true}, zapret:{current:'1.10.4',latest:'1.10.4',available:false} };
+      case 'check_updates': return { app:{current:'0.14.1',latest:'0.14.2',available:true}, zapret:{current:'1.10.4',latest:'1.10.4',available:false} };
       case 'update_zapret': throw 'У вас уже последняя версия обходов';
       case 'update_app': return null;
       case 'open_tg_link': case 'close_window': return null;
@@ -46,22 +46,40 @@ const invoke = T ? T.core.invoke : mock;
 const listen = T ? T.event.listen : async (ev, f) => { (handlers[ev] ||= []).push(f); };
 
 // Движение. «Уменьшить движение» в Windows выключает анимации текста и списков.
+// Кривые те же, что в стилях: торможение, разгон и разгон с торможением.
 const calm = matchMedia('(prefers-reduced-motion: reduce)');
-const EASE = 'cubic-bezier(.2,.8,.2,1)';
+const EASE = 'cubic-bezier(.33,1,.68,1)', EASE_IN = 'cubic-bezier(.32,0,.67,0)', EASE_IO = 'cubic-bezier(.65,0,.35,1)';
+const still = () => calm.matches || document.hidden;
 
 // Окно меняется, только когда что-то правда изменилось: на каждом обновлении
 // состояния браузер не пересчитывает раскладку ради того же самого текста.
-function setText(el, v, anim) {
+// Сравниваем с текстом, который вот-вот появится, а не только с видимым.
+function setText(el, v, anim, dy = 4) {
   v = String(v);
-  if (el.textContent === v) return;
+  if ((el._next ?? el.textContent) === v) return;
+  if (anim && el.animate && !still()) { swap(el, v, dy); return; }
+  if (el._swap) { el._swap.cancel(); el._swap = null; }
+  el._next = undefined;
   el.textContent = v;
-  if (anim) pop(el);
 }
-// Новый текст проявляется, а не подменяется рывком.
-function pop(el, dy = 3) {
-  if (calm.matches || !el.animate) return;
-  el.animate(dy ? [{ opacity: 0, transform: `translateY(${dy}px)` }, { opacity: 1, transform: 'none' }] : [{ opacity: .35 }, { opacity: 1 }],
-    { duration: 220, easing: EASE });
+// Текст сменяется в два шага: старый тает, потом проявляется новый. Если за это
+// время текст поменялся ещё раз, покажется последний, без лишнего мигания.
+// Уход начинается с того места, где сейчас прошлая анимация, а не с полной яркости.
+function swap(el, v, dy) {
+  el._next = v;
+  if (el._swap) return;
+  const out = el.animate([dy ? { opacity: 0, transform: `translateY(${-dy / 2}px)` } : { opacity: 0 }],
+    { duration: 140, easing: EASE_IN, fill: 'forwards' });
+  el._swap = out;
+  out.onfinish = () => {
+    if (el._swap !== out) return;
+    el._swap = null;
+    el.textContent = el._next;
+    el._next = undefined;
+    el.animate(dy ? [{ opacity: 0, transform: `translateY(${dy}px)` }, { opacity: 1, transform: 'none' }] : [{ opacity: 0 }, { opacity: 1 }],
+      { duration: 340, easing: EASE });
+    out.cancel();
+  };
 }
 function setAttr(el, k, v) { v = String(v); if (el.getAttribute(k) !== v) el.setAttribute(k, v); }
 function setHidden(el, h) { h = !!h; if (el.hidden !== h) el.hidden = h; }
@@ -84,13 +102,14 @@ let stopping = false;  // нажали «Стоп», подбор заканчи
 const pick = {};       // результаты подбора по id стратегии
 const PICK_WAIT = 'Дождитесь конца подбора или нажмите «Стоп»';
 
+// Уведомление выезжает пружиной. Если оно уже на экране, меняется только текст:
+// старый тает, новый проявляется, капсула стоит на месте.
 const toast = t => {
-  const el = $('#toast'), shown = el.classList.contains('show');
-  el.textContent = t;
+  const el = $('#toast');
+  setText(el, t, el.classList.contains('show'), 0);
   el.classList.add('show');
-  if (shown) pop(el, 0);
   clearTimeout(toast.t);
-  toast.t = setTimeout(() => el.classList.remove('show'), 2800);
+  toast.t = setTimeout(() => el.classList.remove('show'), 3200);
 };
 const esc = s => String(s).replace(/[&<>"]/g, c => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;' }[c]));
 const both = a => a.length > 1 ? a.slice(0, -1).join(', ') + ' и ' + a[a.length - 1] : a[0];
@@ -117,8 +136,9 @@ async function refresh() {
 $('#wMin').onclick = () => T && T.window.getCurrentWindow().minimize();
 $('#wClose').onclick = () => invoke('close_window');
 
-// Разделы: подложка выбранной вкладки переезжает пружиной, а страница
-// въезжает с той стороны, где стоит вкладка.
+// Разделы: подложка выбранной вкладки переезжает пружиной. Страницы слева от
+// текущей ждут слева, справа справа: новая приезжает со стороны своей вкладки,
+// старая уезжает в другую сторону.
 const tabs = $$('.seg button'), inkEl = $('.seg-ink');
 let page = 'home';
 function ink(instant) {
@@ -131,11 +151,16 @@ function ink(instant) {
 }
 function go(next) {
   if (next === page) return;
-  const from = tabs.findIndex(b => b.dataset.go === page), to = tabs.findIndex(b => b.dataset.go === next);
-  $('main').style.setProperty('--dir', to > from ? 1 : -1);
+  const to = tabs.findIndex(b => b.dataset.go === next);
+  if (to < 0) return;
   page = next;
-  tabs.forEach(b => b.dataset.go === next ? b.setAttribute('aria-current', 'page') : b.removeAttribute('aria-current'));
-  $$('.page').forEach(p => p.classList.toggle('on', p.id === 'p-' + next));
+  tabs.forEach((b, i) => {
+    i === to ? b.setAttribute('aria-current', 'page') : b.removeAttribute('aria-current');
+    const p = $('#p-' + b.dataset.go);
+    if (!p) return;
+    p.style.setProperty('--off', Math.sign(i - to));
+    p.classList.toggle('on', i === to);
+  });
   ink();
   edge();
   if (next === 'set') loadLog();
@@ -162,7 +187,7 @@ powerBtn.addEventListener('pointerdown', e => {
   el.style.cssText = `left:${x - d / 2}px;top:${y - d / 2}px;width:${d}px;height:${d}px`;
   powerBtn.appendChild(el);
   el.classList.add('go');
-  setTimeout(() => el.remove(), 650);
+  setTimeout(() => el.remove(), 950);
 });
 // Блик на кнопке чуть тянется за курсором, как свет на стекле. Сдвигается
 // только слой блика, раз в кадр, без перерисовки кнопки.
@@ -232,22 +257,29 @@ $('#tgData').onclick = e => {
 // Стратегии: подбор на главной, ручной выбор в отдельном окне
 const dlg = $('#stratDlg');
 let stratsKey = '';
-$('#stratOpen').onclick = () => { stratsKey = ''; drawStrats(); dlg.showModal(); };
-// Окно выбора закрывается так же плавно, как открывается.
+// Окно выбора закрывается быстрее, чем открывается, но тоже плавно. Если его
+// открыли снова, пока оно закрывается, оно закрывается сразу и открывается заново.
+let dlgDone = null;
+$('#stratOpen').onclick = () => {
+  if (dlgDone) { dlgDone(); dlg.getBoundingClientRect(); }
+  stratsKey = ''; drawStrats(); dlg.showModal();
+};
 function closeDlg() {
-  if (!dlg.open || dlg.classList.contains('closing')) return;
+  if (!dlg.open || dlgDone) return;
   if (calm.matches) { dlg.close(); return; }
   dlg.classList.add('closing');
   let timer = 0;
   const done = () => {
     clearTimeout(timer);
     dlg.removeEventListener('animationend', onEnd);
+    dlgDone = null;
     dlg.classList.remove('closing');
     dlg.close();
   };
   const onEnd = e => { if (e.target === dlg) done(); };
+  dlgDone = done;
   dlg.addEventListener('animationend', onEnd);
-  timer = setTimeout(done, 300);
+  timer = setTimeout(done, 380);
 }
 $('#dlgClose').onclick = closeDlg;
 dlg.onclick = e => { if (e.target === dlg) closeDlg(); };
@@ -310,8 +342,9 @@ $('#pickBtn').onclick = async () => {
 // «Подобрать стратегию» в меню значка в трее: Prism открывает окно и сразу начинает.
 listen('tray-pick', () => { go('home'); if (S && !picking && !busy) $('#pickBtn').click(); });
 
-// Сайты: список перерисовывается, только когда он изменился. Новый сайт
-// появляется сверху, убранный уезжает вправо.
+// Сайты: список перерисовывается, только когда он изменился. Новая строка
+// раскрывается сверху, убранная уезжает вправо и схлопывается: соседние строки
+// съезжают плавно, а не прыгают.
 let sitesKey = '', added = false;
 function drawSites() {
   const list = S.user_sites, n = S.builtin_sites;
@@ -322,17 +355,37 @@ function drawSites() {
     || '<div class="empty">Здесь пока пусто. Добавьте сайт, который не открывается.</div>';
   setText($('#builtin'), `Ещё ${n} ${plural(n, 'сайт', 'сайта', 'сайтов')} уже есть во встроенном списке: Discord, YouTube и другие. Первые три сайта из вашего списка проверяет подбор.`);
   const first = $('#sites').firstElementChild;
-  if (added && first && !calm.matches) first.animate([{ opacity: 0, transform: 'translateY(-6px)' }, { opacity: 1, transform: 'none' }], { duration: 260, easing: EASE });
+  if (added && first && first.animate && !still()) grow(first);
   added = false;
+}
+// Размеры строки для анимации высоты: высота и отступы, как сейчас в раскладке.
+function box(row) {
+  const cs = getComputedStyle(row), h = row.offsetHeight + 'px';
+  return [{ height: '0px', minHeight: '0px', paddingTop: '0px', paddingBottom: '0px' },
+    { height: h, minHeight: h, paddingTop: cs.paddingTop, paddingBottom: cs.paddingBottom }];
+}
+function grow(row) {
+  const [shut, open] = box(row);
+  row.style.overflow = 'hidden';
+  row.animate([shut, open], { duration: 380, easing: EASE_IO }).onfinish = () => { row.style.overflow = ''; };
+  row.animate([{ opacity: 0, transform: 'translateY(-6px)' }, { opacity: 1, transform: 'none' }], { duration: 420, delay: 120, easing: EASE, fill: 'backwards' });
+}
+function shrink(row) {
+  const [shut, open] = box(row);
+  row.style.overflow = 'hidden';
+  const fade = row.animate([{ opacity: 1, transform: 'none' }, { opacity: 0, transform: 'translateX(16px)' }], { duration: 240, easing: EASE_IN, fill: 'forwards' });
+  const fold = row.animate([open, shut], { duration: 320, delay: 160, easing: EASE_IO, fill: 'forwards' });
+  return { done: f => { fold.onfinish = f; }, undo: () => { fade.cancel(); fold.cancel(); row.style.overflow = ''; } };
 }
 $('#sites').addEventListener('click', e => {
   const b = e.target.closest('[data-del]');
   if (!b) return;
   const domain = b.dataset.del, row = b.closest('.row');
   b.disabled = true;
-  row.classList.add('leaving');
-  setTimeout(() => call('remove_site', { domain }, `${domain} убран из списка`)
-    .catch(() => { row.classList.remove('leaving'); b.disabled = false; }), calm.matches ? 0 : 150);
+  const anim = row.animate && !still() ? shrink(row) : null;
+  const remove = () => call('remove_site', { domain }, `${domain} убран из списка`)
+    .catch(() => { if (anim) anim.undo(); b.disabled = false; });
+  anim ? anim.done(remove) : remove();
 });
 $('#addForm').onsubmit = async e => {
   e.preventDefault();
@@ -385,8 +438,8 @@ function drawClock() {
   if (!S) return;
   const on = S.engine_on && !busy && !picking;
   const since = S.since || onSince;
-  setText($('#uptime'), on && since ? `Работает ${dur(Date.now() - since)}` : '');
-  setText($('#checked'), S.engine_on && checkedAt && !picking ? ago(checkedAt) : '');
+  setText($('#uptime'), on && since ? `Работает ${dur(Date.now() - since)}` : '', true);
+  setText($('#checked'), S.engine_on && checkedAt && !picking ? ago(checkedAt) : '', true);
 }
 setInterval(drawClock, 15000);
 
@@ -439,7 +492,7 @@ function render() {
   const cur = S.strategies.find(x => pick[x.id] && pick[x.id].state === 'wait');
   // Во время подбора подпись говорит, что идёт проверка, а в строке только имя:
   // так оно влезает в одну строку и строка не меняет высоту.
-  setText($('#stratK'), picking ? (cur ? 'Проверяю' : 'Подбор') : 'Стратегия');
+  setText($('#stratK'), picking ? (cur ? 'Проверяю' : 'Подбор') : 'Стратегия', true);
   const sName = !total ? 'Не найдены. Переустановите Prism'
     : picking ? (cur ? cur.name : 'Готовлю проверку') : (strat ? strat.name : S.strategy);
   setText($('#stratName'), sName, true);
@@ -448,7 +501,7 @@ function render() {
   // Сеть, для которой запомнена стратегия: в другой сети Prism включит свою.
   const sn = $('#stratNet');
   setHidden(sn, !S.network);
-  setText(sn, picking ? `Запомню для сети «${S.network}»` : S.profile ? `Запомнена для сети «${S.network}»` : `Сеть «${S.network}»`);
+  setText(sn, picking ? `Запомню для сети «${S.network}»` : S.profile ? `Запомнена для сети «${S.network}»` : `Сеть «${S.network}»`, true);
   const d = picking ? `${Math.max(2, Math.round(done / Math.max(total, 1) * 100))} 100` : '';
   if (d !== dash) { dash = d; $('#arc').style.strokeDasharray = d; }
   const pb = $('#pickBtn');
